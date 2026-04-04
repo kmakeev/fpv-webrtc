@@ -1,0 +1,135 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: #0a0a0a;
+  color: #e0e0e0;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ── UI оверлей ─────────────────────────────────────────────────────────── */
+#ui {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  z-index: 10;
+  background: rgba(10, 10, 10, 0.92);
+  transition: opacity 0.4s;
+}
+#ui.hidden { opacity: 0; pointer-events: none; }
+
+#status-panel {
+  text-align: center;
+}
+
+h1 {
+  font-size: 2rem;
+  font-weight: 300;
+  letter-spacing: 0.15em;
+  color: #fff;
+  margin-bottom: 16px;
+}
+
+/* ── Статус ─────────────────────────────────────────────────────────────── */
+.status {
+  display: inline-block;
+  padding: 8px 20px;
+  border-radius: 20px;
+  font-size: 0.9rem;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+}
+.status.connecting  { background: #1a2a3a; color: #5b9bd5; border: 1px solid #2a4a6a; }
+.status.waiting     { background: #1a2a1a; color: #5bd58a; border: 1px solid #2a5a2a; }
+.status.streaming   { background: #0d2010; color: #40c060; border: 1px solid #1a4a1a; }
+.status.error       { background: #2a1010; color: #d55b5b; border: 1px solid #5a2020; }
+.status.disconnected{ background: #1a1a1a; color: #888;    border: 1px solid #333; }
+
+#details {
+  margin-top: 8px;
+  font-size: 0.75rem;
+  color: #666;
+  min-height: 1.2em;
+}
+
+/* ── Кнопки ─────────────────────────────────────────────────────────────── */
+button {
+  padding: 14px 36px;
+  border: none;
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.2s, transform 0.1s;
+  letter-spacing: 0.03em;
+}
+button:disabled { opacity: 0.3; cursor: default; }
+button:not(:disabled):hover  { opacity: 0.85; }
+button:not(:disabled):active { transform: scale(0.97); }
+
+#btn-vr   { background: #2563eb; color: #fff; }
+#btn-flat { background: #374151; color: #e0e0e0; }
+
+/* ── Статистика ─────────────────────────────────────────────────────────── */
+#stats-bar {
+  display: flex;
+  gap: 24px;
+  font-size: 0.78rem;
+  color: #555;
+  font-variant-numeric: tabular-nums;
+}
+#stats-bar span { min-width: 90px; text-align: center; }
+
+/* ── Подсказка ──────────────────────────────────────────────────────────── */
+#hint {
+  max-width: 480px;
+  text-align: center;
+  font-size: 0.8rem;
+  line-height: 1.7;
+  color: #444;
+}
+#hint code {
+  background: #1a1a1a;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 1px 6px;
+  color: #7ec8e3;
+  font-size: 0.85em;
+}
+
+/* ── Оверлей в VR (HUD поверх картинки) ────────────────────────────────── */
+#vr-hud {
+  display: none;
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0,0,0,0.6);
+  border-radius: 12px;
+  padding: 8px 20px;
+  font-size: 0.75rem;
+  color: #aaa;
+  z-index: 20;
+  pointer-events: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Плоский видеоэкран (режим без VR) ─────────────────────────────────── */
+.flat-info {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0,0,0,0.7);
+  border-radius: 8px;
+  padding: 6px 16px;
+  font-size: 0.75rem;
+  color: #888;
+  z-index: 20;
+  pointer-events: none;
+}

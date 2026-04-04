@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FPV Viewer — Quest 2</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- ══ UI оверлей (виден пока не в VR) ══════════════════════════════════════ -->
+<div id="ui">
+  <div id="status-panel">
+    <h1>FPV Viewer</h1>
+    <div id="status" class="status connecting">Подключение к серверу...</div>
+    <div id="details"></div>
+  </div>
+
+  <div id="stats-bar">
+    <span id="stat-latency">—</span>
+    <span id="stat-fps">—</span>
+    <span id="stat-resolution">—</span>
+    <span id="stat-codec">—</span>
+  </div>
+
+  <button id="btn-vr" disabled>Войти в VR</button>
+  <button id="btn-flat" disabled>Смотреть на экране</button>
+
+  <div id="hint">
+    Убедитесь, что ноутбук и Quest 2 в одной Wi-Fi сети.<br>
+    Запустите <code>node server/server.js</code> на ноутбуке,<br>
+    затем откройте <code>http://&lt;IP_ноутбука&gt;:8080</code> в браузере Quest 2.
+  </div>
+</div>
+
+<!-- ══ Видео-элементы ════════════════════════════════════════════════════════ -->
+<!-- Плоский просмотр (fallback) -->
+<video id="video-flat" autoplay playsinline muted style="display:none;
+  position:fixed;top:0;left:0;width:100%;height:100%;object-fit:contain;
+  background:#000;z-index:0;"></video>
+
+<!-- WebXR canvas -->
+<canvas id="xr-canvas" style="display:none;position:fixed;top:0;left:0;
+  width:100%;height:100%;background:#000;z-index:0;"></canvas>
+
+<script src="js/webrtc-client.js"></script>
+<script src="js/webxr-renderer.js"></script>
+<script src="js/stats.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>

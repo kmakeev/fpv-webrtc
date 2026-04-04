@@ -1,0 +1,30 @@
+services:
+
+  # HTTP-режим (локальная разработка): docker compose --profile http up
+  fpv-http:
+    build: .
+    container_name: fpv-webrtc-http
+    profiles:
+      - http
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+    restart: unless-stopped
+
+  # HTTPS/TLS-режим (Quest 2): ./gen-certs.sh && docker compose --profile tls up
+  fpv-tls:
+    build: .
+    container_name: fpv-webrtc-tls
+    profiles:
+      - tls
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      TLS: "1"
+    volumes:
+      - ./server/certs:/app/server/certs:ro
+    restart: unless-stopped

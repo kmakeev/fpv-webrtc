@@ -1,0 +1,13 @@
+{
+  "name": "fpv-webrtc-server",
+  "version": "1.0.0",
+  "description": "WebRTC signaling server for ESP32-P4 FPV → Quest 2",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js",
+    "dev":   "node --watch server/server.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  }
+}

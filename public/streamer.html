@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>FPV Streamer — Ноутбук</title>
+<style>
+  body { font-family: system-ui; background: #111; color: #ccc;
+    margin: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; min-height: 100vh; gap: 16px; }
+  h2   { color: #fff; margin: 0; }
+  video { width: 480px; border-radius: 8px; background: #000; }
+  #status { padding: 8px 20px; border-radius: 20px; font-size: 0.85rem; }
+  .waiting   { background: #1a2a3a; color: #5b9bd5; }
+  .streaming { background: #0d2010; color: #40c060; }
+  .error     { background: #2a1010; color: #d55b5b; }
+  p { font-size: 0.8rem; color: #555; text-align: center; max-width: 420px; }
+  code { background: #1a1a1a; border: 1px solid #333; border-radius: 4px;
+    padding: 1px 6px; color: #7ec8e3; }
+</style>
+</head>
+<body>
+<h2>FPV Streamer (тестовый)</h2>
+<div id="status" class="waiting">Ожидание вьювера...</div>
+<video id="preview" autoplay muted playsinline></video>
+<p>
+  Эта страница захватывает вебкамеру ноутбука и стримит её в Quest 2 через WebRTC.<br>
+  Откройте в браузере ноутбука: <code>http://localhost:8080/streamer.html</code><br>
+  Quest 2 открывает: <code>http://&lt;IP&gt;:8080/</code>
+</p>
+
+<script>
+(function () {
+  const ICE_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  const statusEl = document.getElementById('status');
+  const preview  = document.getElementById('preview');
+
+  const wsUrl = window.location.origin.replace(/^http/, 'ws');
+  let ws, pc, localStream;
+
+  function setStatus(cls, text) {
+    statusEl.className = cls;
+    statusEl.textContent = text;
+  }
+
+  // ── Захват вебкамеры ────────────────────────────────────────────────────
+  async function startCamera() {
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720, frameRate: 30 },
+        audio: false,
+      });
+      preview.srcObject = localStream;
+      console.log('[Streamer] camera ok');
+    } catch (e) {
+      setStatus('error', 'Камера: ' + e.message);
+      throw e;
+    }
+  }
+
+  // ── WebSocket ───────────────────────────────────────────────────────────
+  function connectWs() {
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'role', role: 'streamer' }));
+      setStatus('waiting', 'Ожидание вьювера...');
+      initPC();
+    };
+
+    ws.onmessage = async (ev) => {
+      const msg = JSON.parse(ev.data);
+
+      if (msg.type === 'viewer_ready') {
+        setStatus('waiting', 'Вьювер подключился, создаём offer...');
+        const offer = await pc.createOffer({
+          offerToReceiveVideo: false,
+          offerToReceiveAudio: false,
+        });
+        // Предпочесть H.264
+        offer.sdp = preferH264(offer.sdp);
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp, type: offer.type }));
+      }
+
+      if (msg.type === 'answer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(msg));
+      }
+
+      if (msg.type === 'ice' && msg.candidate) {
+        await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      }
+
+      if (msg.type === 'peer_disconnected') {
+        setStatus('waiting', 'Вьювер отключился');
+      }
+    };
+
+    ws.onclose = () => { setTimeout(connectWs, 3000); };
+    ws.onerror = (e) => { console.error('[WS] error:', e); ws.close(); };
+  }
+
+  // ── PeerConnection ──────────────────────────────────────────────────────
+  function initPC() {
+    pc = new RTCPeerConnection(ICE_CONFIG);
+
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'ice', candidate: ev.candidate }));
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') setStatus('streaming', '● Стримим в Quest 2');
+      if (['disconnected','failed'].includes(pc.connectionState))
+        setStatus('waiting', 'Quest 2 отключился');
+    };
+  }
+
+  // ── Предпочесть H.264 ───────────────────────────────────────────────────
+  function preferH264(sdp) {
+    return sdp.split('\r\n').map(line => {
+      if (!line.startsWith('m=video')) return line;
+      const parts = line.split(' ');
+      const header = parts.slice(0, 3);
+      const pts = parts.slice(3);
+      const h264 = [], others = [];
+      pts.forEach(pt => {
+        sdp.split('\r\n').some(l => l.startsWith(`a=rtpmap:${pt} H264`))
+          ? h264.push(pt) : others.push(pt);
+      });
+      return [...header, ...h264, ...others].join(' ');
+    }).join('\r\n');
+  }
+
+  // ── Старт ───────────────────────────────────────────────────────────────
+  startCamera().then(connectWs).catch(console.error);
+})();
+</script>
+</body>
+</html>
