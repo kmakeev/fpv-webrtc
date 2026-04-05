@@ -1,0 +1,11 @@
+# Copy this file to local.properties and set sdk.dir to your Android SDK path.
+# local.properties is listed in .gitignore and should NOT be committed.
+#
+# macOS default:
+sdk.dir=/Users/YOUR_USERNAME/Library/Android/sdk
+#
+# Example for this machine:
+# sdk.dir=/Users/konstantin/Library/Android/sdk
+#
+# NDK version (if not using default from build.gradle):
+# ndk.dir=/Users/YOUR_USERNAME/Library/Android/sdk/ndk/27.2.12479018

@@ -1,0 +1,74 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.fpv.quest'
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "com.fpv.quest"
+        // Quest 2 runs Android 10 (API 29) minimum
+        minSdk 29
+        // Target Android 12L (API 32) — last version with full Quest 2 support
+        targetSdk 32
+        versionCode 1
+        versionName "0.1.0"
+
+        // Quest 2 is ARM64 only — skip x86/x86_64/armeabi-v7a
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17"
+                arguments "-DANDROID_ARM_NEON=TRUE"
+            }
+        }
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+    // Google pre-built libwebrtc for Android (includes PeerConnectionFactory,
+    // HardwareVideoDecoderFactory, DataChannel, JNI bindings)
+    implementation 'io.github.webrtc-sdk:android:125.6422.07'
+
+    // OkHttp for WebSocket signaling (same protocol as server/server.js)
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+
+    // Coroutines for async clock sync and WebSocket callbacks
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0'
+
+    // JSON parsing (bundled with Android SDK — org.json)
+    // No extra dep needed
+}

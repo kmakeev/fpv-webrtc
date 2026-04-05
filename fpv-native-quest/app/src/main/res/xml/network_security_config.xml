@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Allows cleartext (ws://, http://) traffic to LAN hosts for development.
+    In production (ws:// → wss://) this can be restricted to domain-config only.
+    See: docs/native-android-setup.md
+-->
+<network-security-config>
+    <!-- LAN / private IP ranges: allow ws:// for dev server -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">192.168.0.0</domain>
+        <domain includeSubdomains="true">192.168.1.0</domain>
+        <domain includeSubdomains="true">10.0.0.0</domain>
+        <domain includeSubdomains="true">172.16.0.0</domain>
+        <domain includeSubdomains="true">localhost</domain>
+    </domain-config>
+</network-security-config>

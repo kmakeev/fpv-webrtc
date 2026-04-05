@@ -1,3 +1,15 @@
 node_modules/
 server/certs/
 .DS_Store
+
+# Android / fpv-native-quest
+fpv-native-quest/.gradle/
+fpv-native-quest/build/
+fpv-native-quest/app/build/
+fpv-native-quest/local.properties
+fpv-native-quest/.idea/
+fpv-native-quest/*.iml
+fpv-native-quest/captures/
+fpv-native-quest/.externalNativeBuild/
+fpv-native-quest/app/.externalNativeBuild/
+fpv-native-quest/app/.cxx/

@@ -88,6 +88,87 @@ e2eMs = Date.now()_viewer - captureTs_streamer + clockOffset
 | `ts`   | streamer → viewer | `{ capture, encode }` — раз в секунду |
 | `head` | viewer → streamer | `{ x, y, z, w }` — зарезервировано, не отправляется (управление через контроллеры) |
 
+## Нативное приложение (fpv-native-quest/)
+
+Android-приложение для Quest 2, которое заменит браузерный просмотрщик и снизит E2E-задержку с ~65–100 мс до ~15–35 мс.
+
+### Структура проекта
+
+```
+fpv-native-quest/                    # Android Studio project root
+├── settings.gradle / build.gradle   # Gradle 8.7, AGP 8.3, Kotlin 1.9
+├── gradlew                          # Gradle wrapper (chmod +x уже выставлен)
+├── local.properties.template        # Скопировать → local.properties, указать sdk.dir
+└── app/
+    ├── build.gradle                 # minSdk=29, targetSdk=32, arm64-v8a, NDK
+    └── src/main/
+        ├── AndroidManifest.xml      # INTERNET, VR headtracking, landscape
+        ├── java/com/fpv/quest/
+        │   ├── MainActivity.kt      # Activity-точка входа, TODO TASK-003/004
+        │   ├── SignalingClient.kt   # OkHttp WebSocket, протокол = server.js
+        │   ├── WebRTCEngine.kt      # PeerConnectionFactory + preferH264(), TODO TASK-003
+        │   └── FPVDataChannel.kt   # NTP clock sync + E2E, зеркало datachannel.js
+        ├── cpp/
+        │   ├── CMakeLists.txt       # libfpv-native.so, links EGL + GLESv3 + log
+        │   ├── xr_renderer.cpp      # TODO TASK-004: OpenXR stereo rendering
+        │   └── video_decoder.cpp    # TODO TASK-004: SurfaceTexture zero-copy
+        └── res/xml/network_security_config.xml  # ws:// cleartext для LAN
+```
+
+### Требования к окружению
+
+| Компонент | Версия | Установка |
+|-----------|--------|-----------|
+| JDK | 17 | `brew install openjdk@17` |
+| NDK | 27.x | Android Studio → SDK Manager → SDK Tools |
+| CMake | 3.22.1 | Android Studio → SDK Manager → SDK Tools |
+| Android API | 32 | Android Studio → SDK Manager → SDK Platforms |
+
+Подробная инструкция: `docs/native-android-setup.md`.
+
+### Gradle-команды
+
+```bash
+cd fpv-native-quest/
+
+# Первый запуск: создать local.properties
+cp local.properties.template local.properties
+# Отредактировать sdk.dir → /Users/konstantin/Library/Android/sdk
+
+# Сборка debug APK
+./gradlew assembleDebug
+# APK: app/build/outputs/apk/debug/app-debug.apk
+
+# Сборка + установка на подключённый Quest 2
+./gradlew installDebug
+
+# Запуск установленного приложения через ADB
+adb shell am start -n com.fpv.quest/.MainActivity
+
+# Логи в реальном времени
+adb logcat -s FPVQuest SignalingClient WebRTCEngine FPVDataChannel xr_renderer video_decoder
+
+# Переустановка без удаления данных
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+### Зависимости (app/build.gradle)
+
+| Библиотека | Версия | Назначение |
+|------------|--------|-----------|
+| `io.github.webrtc-sdk:android` | 125.6422.07 | Google pre-built libwebrtc: PeerConnectionFactory, HardwareVideoDecoderFactory, DataChannel |
+| `com.squareup.okhttp3:okhttp` | 4.12.0 | WebSocket для сигналинга |
+| `kotlinx-coroutines-android` | 1.8.0 | Async clock sync, WebSocket callbacks |
+
+### Соответствие JS ↔ Kotlin модулей
+
+| JS (public/js/) | Kotlin (com/fpv/quest/) | Статус |
+|-----------------|------------------------|--------|
+| `webrtc-client.js` | `WebRTCEngine.kt` + `SignalingClient.kt` | TASK-003 |
+| `datachannel.js` | `FPVDataChannel.kt` | TASK-005 |
+| `webxr-renderer.js` | `xr_renderer.cpp` (JNI) | TASK-004 |
+| `stats.js` | inline в `MainActivity.kt` | TASK-005 |
+
 ## Ключевые технические ограничения
 
 - WebXR требует HTTPS (`TLS=1`), кроме случая `localhost`.
