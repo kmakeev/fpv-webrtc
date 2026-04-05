@@ -28,6 +28,7 @@
   Quest 2 открывает: <code>http://&lt;IP&gt;:8080/</code>
 </p>
 
+<script src="js/datachannel.js"></script>
 <script>
 (function () {
   const ICE_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
@@ -36,6 +37,7 @@
 
   const wsUrl = window.location.origin.replace(/^http/, 'ws');
   let ws, pc, localStream;
+  let _tsTimer = null;   // таймер отправки временны́х меток
 
   function setStatus(cls, text) {
     statusEl.className = cls;
@@ -105,6 +107,18 @@
 
     localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
+    // DataChannel создаётся до createOffer(), чтобы попасть в SDP
+    FPVDataChannel.create(pc);
+
+    FPVDataChannel.onOpen = () => {
+      console.log('[Streamer] DC open, starting timestamp loop');
+      _startTsLoop();
+    };
+
+    FPVDataChannel.onClose = () => {
+      _stopTsLoop();
+    };
+
     pc.onicecandidate = (ev) => {
       if (ev.candidate && ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'ice', candidate: ev.candidate }));
@@ -113,9 +127,30 @@
 
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'connected') setStatus('streaming', '● Стримим в Quest 2');
-      if (['disconnected','failed'].includes(pc.connectionState))
+      if (['disconnected','failed'].includes(pc.connectionState)) {
         setStatus('waiting', 'Quest 2 отключился');
+        _stopTsLoop();
+      }
     };
+  }
+
+  // ── Отправка временны́х меток захвата ──────────────────────────────────
+  function _startTsLoop() {
+    _stopTsLoop();
+    _tsTimer = setInterval(() => {
+      const capture = Date.now();
+      // Для вебкамеры encode-задержку не измерить напрямую;
+      // encode ≈ capture (браузер кодирует асинхронно).
+      // На ESP32-P4 это поле будет содержать реальное время кодирования.
+      FPVDataChannel.send({ type: 'ts', capture, encode: capture });
+    }, 1000);
+  }
+
+  function _stopTsLoop() {
+    if (_tsTimer !== null) {
+      clearInterval(_tsTimer);
+      _tsTimer = null;
+    }
   }
 
   // ── Предпочесть H.264 ───────────────────────────────────────────────────

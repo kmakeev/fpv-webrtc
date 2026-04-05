@@ -31,6 +31,9 @@
       '<span id="fs-res">—</span>' +
       '<span>·</span>' +
       '<span id="fs-codec">—</span>' +
+    '</div>' +
+    '<div class="fs-row" id="fs-e2e-row" style="display:none">' +
+      '<span id="fs-e2e">E2E: —</span>' +
     '</div>';
 
   // ── Определяем адрес сервера ──────────────────────────────────────────────
@@ -61,11 +64,8 @@
     mode = 'none';
   };
 
-  FPVRenderer.onHeadPose = (quaternion) => {
-    // TODO: отправить в DataChannel для управления сервой камеры
-    // Будет реализовано в следующем модуле (datachannel.js)
-    // _dc.send(JSON.stringify({ type: 'head', ...quaternion }));
-  };
+  // Управление камерой через контроллеры — TODO
+  // FPVRenderer.onHeadPose не используется
 
   // ── Статус UI ─────────────────────────────────────────────────────────────
   function setStatus(cls, label, detail) {
@@ -106,10 +106,20 @@
 
     // Запускаем сбор статистики
     FPVStats.start(FPVClient.getPeerConnection());
+
+    // Подписываемся на временны́е метки от стримера для E2E задержки
+    FPVDataChannel.onTimestamp = ({ capture, encode }) => {
+      const offset = FPVDataChannel.getOffset();
+      if (offset === null) return;   // синхронизация ещё не выполнена
+      const e2eMs    = Math.round(Date.now() - capture + offset);
+      const encodeMs = Math.round(encode - capture);
+      FPVStats.updateE2E({ e2eMs, encodeMs });
+    };
   };
 
   FPVClient.onDisconnect = () => {
     FPVStats.stop();
+    FPVDataChannel.onTimestamp = null;
     videoFlat.srcObject = null;
     flatStats.style.display = 'none';
     if (mode === 'flat') {

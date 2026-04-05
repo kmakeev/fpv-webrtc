@@ -125,6 +125,23 @@
         FPVClient.onStatus('streaming', 'Соединение установлено');
       }
     };
+
+    // Принимаем DataChannel от стримера
+    FPVDataChannel.accept(pc);
+
+    FPVDataChannel.onOpen = () => {
+      console.log('[DC] open, syncing clocks in 3s (jitter buffer stabilisation)');
+      // Задержка 3с — даём jitter-буферу устояться до начала ping-pong синхронизации.
+      // Без задержки 5 rapid SCTP пингов раскачивают буфер с ~19ms до ~40ms.
+      setTimeout(
+        () => FPVDataChannel.syncClocks().catch(e => console.warn('[DC] syncClocks error:', e)),
+        3000
+      );
+    };
+
+    FPVDataChannel.onClose = () => {
+      if (window.FPVStats) FPVStats.clearE2E();
+    };
   }
 
   // ── Обработка сигналинг-сообщений ────────────────────────────────────────

@@ -4,10 +4,16 @@
  *
  * Метрики задержки:
  *   Сеть    — RTT/2 из candidate-pair (одностороннее сетевое время)
- *   Декод   — среднее время декодирования кадра (totalDecodeTime / framesDecoded)
- *   Буфер   — задержка джиттер-буфера (jitterBufferDelay / jitterBufferEmittedCount)
- *   Итого   — сумма выше: оценка задержки на стороне получателя
- *             (не включает захват и энкодинг на стороне стримера)
+ *   Декод   — totalDecodeTime/framesDecoded за интервал.
+ *             На Android/Quest включает async MediaCodec pipeline (~38ms),
+ *             на desktop Chromium — чистое время декодера (~1ms).
+ *             requestVideoFrameCallback.processingDuration даёт ту же картину
+ *             на Android (одинаковый источник) и добавляет CPU-нагрузку —
+ *             от rVFC отказались в пользу getStats().
+ *   Буфер   — jitterBufferDelay / jitterBufferEmittedCount
+ *   Итого   — Сеть + Декод + Буфер (оценка задержки на стороне получателя)
+ *   E2E     — DataChannel: viewer_now − capture_streamer + clockOffset
+ *             (задержка SCTP-сообщения; реальный E2E видеокадра = E2E + Буфер + Декод)
  *
  * Экспортирует: window.FPVStats
  */
@@ -18,8 +24,12 @@
   let _timer      = null;
   let _prevTs     = 0;
   let _prevFrames = 0;
-  let _prevDecodeTime = 0;
+  let _prevDecodeTime   = 0;
   let _prevDecodeFrames = 0;
+
+  // E2E метрики из DataChannel (null — нет данных)
+  let _e2eMs    = null;   // SCTP-задержка DataChannel
+  let _encodeMs = null;   // время энкодинга на стримере
 
   // Элементы основного статус-бара (под кнопками)
   const bar = {
@@ -29,7 +39,7 @@
     codec:      document.getElementById('stat-codec'),
   };
 
-  // Элементы VR HUD (dom-overlay, не используется — оставлено для совместимости)
+  // Элементы VR HUD
   const hud = {
     net:    document.getElementById('vr-net'),
     decode: document.getElementById('vr-decode'),
@@ -38,10 +48,11 @@
     fps:    document.getElementById('vr-fps'),
     res:    document.getElementById('vr-res'),
     codec:  document.getElementById('vr-codec'),
+    e2eRow: document.getElementById('vr-e2e-row'),
+    e2e:    document.getElementById('vr-e2e'),
   };
 
-  // Элементы flat-stats (поверх плоского видео)
-  // Элементы создаются динамически в main.js, поэтому ищем через геттер
+  // Элементы flat-stats (создаются динамически в main.js)
   function fs(id) { return document.getElementById(id); }
 
   function _set(el, text) { if (el) el.textContent = text; }
@@ -58,17 +69,20 @@
     _set(hud.fps,    '—');
     _set(hud.res,    '—');
     _set(hud.codec,  '—');
+    if (hud.e2eRow) hud.e2eRow.style.display = 'none';
+    const fsE2e = fs('fs-e2e-row');
+    if (fsE2e) fsE2e.style.display = 'none';
   }
 
   async function _poll() {
     if (!_pc) return;
     try {
       const stats = await _pc.getStats();
-      let inbound     = null;
-      let candPair    = null;
+      let inbound  = null;
+      let candPair = null;
 
       stats.forEach(r => {
-        if (r.type === 'inbound-rtp'   && r.kind === 'video') inbound  = r;
+        if (r.type === 'inbound-rtp'    && r.kind === 'video') inbound  = r;
         if (r.type === 'candidate-pair' && r.state === 'succeeded')    candPair = r;
       });
 
@@ -126,20 +140,33 @@
         if (cr?.mimeType) codecStr = cr.mimeType.replace('video/', '');
       }
 
+      // ── E2E строка ───────────────────────────────────────────────────────
+      const e2eStr = _e2eMs != null
+        ? `E2E: ~${_e2eMs}ms · энк ${_encodeMs ?? 0}ms`
+        : null;
+
       // ── Запись в основной бар ─────────────────────────────────────────
-      _set(bar.latency,    netMs    != null ? `Net: ~${netMs} ms`   : '—');
-      _set(bar.fps,        fps      != null ? `${fps} fps`          : '—');
-      _set(bar.resolution, resStr              ? resStr               : '—');
-      _set(bar.codec,      codecStr            ? codecStr             : '—');
+      _set(bar.latency,    e2eStr  != null ? e2eStr                      : (netMs != null ? `Net: ~${netMs}ms` : '—'));
+      _set(bar.fps,        fps     != null ? `${fps} fps`                : '—');
+      _set(bar.resolution, resStr          ? resStr                       : '—');
+      _set(bar.codec,      codecStr        ? codecStr                     : '—');
 
       // ── Запись в DOM VR HUD ──────────────────────────────────────────────
-      _set(hud.net,    netMs    != null ? `Сеть: ~${netMs}ms`       : 'Сеть: —');
-      _set(hud.decode, decodeMs != null ? `Декод: ${decodeMs}ms`    : 'Декод: —');
-      _set(hud.jitter, jitterMs != null ? `Буфер: ${jitterMs}ms`    : 'Буфер: —');
-      _set(hud.total,  totalMs  >  0    ? `Итого: ~${totalMs}ms`    : 'Итого: —');
-      _set(hud.fps,    fps      != null ? `${fps} fps`              : '—');
-      _set(hud.res,    resStr              ? resStr                   : '—');
-      _set(hud.codec,  codecStr            ? codecStr                 : '—');
+      _set(hud.net,    netMs    != null ? `Сеть: ~${netMs}ms`    : 'Сеть: —');
+      _set(hud.decode, decodeMs != null ? `Декод: ${decodeMs}ms` : 'Декод: —');
+      _set(hud.jitter, jitterMs != null ? `Буфер: ${jitterMs}ms` : 'Буфер: —');
+      _set(hud.total,  totalMs  >  0    ? `Итого: ~${totalMs}ms` : 'Итого: —');
+      _set(hud.fps,    fps      != null ? `${fps} fps`           : '—');
+      _set(hud.res,    resStr           ? resStr                  : '—');
+      _set(hud.codec,  codecStr         ? codecStr                : '—');
+      if (hud.e2eRow && hud.e2e) {
+        if (e2eStr != null) {
+          _set(hud.e2e, e2eStr);
+          hud.e2eRow.style.display = '';
+        } else {
+          hud.e2eRow.style.display = 'none';
+        }
+      }
 
       // ── Flat stats overlay ───────────────────────────────────────────────
       _set(fs('fs-net'),    netMs    != null ? `Сеть: ~${netMs}ms`    : 'Сеть: —');
@@ -149,15 +176,25 @@
       _set(fs('fs-fps'),    fps      != null ? `${fps} fps`           : '—');
       _set(fs('fs-res'),    resStr           ? resStr                  : '—');
       _set(fs('fs-codec'),  codecStr         ? codecStr                : '—');
+      const fsE2eRow = fs('fs-e2e-row');
+      if (fsE2eRow) {
+        if (e2eStr != null) {
+          _set(fs('fs-e2e'), e2eStr);
+          fsE2eRow.style.display = '';
+        } else {
+          fsE2eRow.style.display = 'none';
+        }
+      }
 
       // ── WebGL HUD (рендерится прямо в XR-сцену) ─────────────────────────
       if (window.FPVRenderer) {
-        const net  = netMs    != null ? `~${netMs}ms`    : '—ms';
-        const dec  = decodeMs != null ? `${decodeMs}ms`  : '—ms';
-        const buf  = jitterMs != null ? `${jitterMs}ms`  : '—ms';
-        const tot  = totalMs  >  0    ? `~${totalMs}ms`  : '—ms';
+        const net = netMs    != null ? `~${netMs}ms`   : '—ms';
+        const dec = decodeMs != null ? `${decodeMs}ms` : '—ms';
+        const buf = jitterMs != null ? `${jitterMs}ms` : '—ms';
+        const tot = totalMs  >  0    ? `~${totalMs}ms` : '—ms';
         const line1 = `Сеть ${net}  Декод ${dec}  Буфер ${buf}  Итого ${tot}`;
-        const line2 = `${fps ?? '—'} fps  ${resStr ?? '—'}  ${codecStr ?? '—'}`;
+        let line2 = `${fps ?? '—'} fps  ${resStr ?? '—'}  ${codecStr ?? '—'}`;
+        if (e2eStr != null) line2 += `  |  ${e2eStr}`;
         FPVRenderer.updateStats(line1, line2);
       }
 
@@ -174,8 +211,22 @@
     },
     stop() {
       clearInterval(_timer);
-      _pc = null;
+      _pc       = null;
+      _e2eMs    = null;
+      _encodeMs = null;
       _reset();
+    },
+
+    /** Обновить E2E метрику (вызывается из main.js при получении ts-сообщения) */
+    updateE2E({ e2eMs, encodeMs }) {
+      _e2eMs    = e2eMs;
+      _encodeMs = encodeMs;
+    },
+
+    /** Сбросить E2E метрику (вызывается при закрытии DataChannel) */
+    clearE2E() {
+      _e2eMs    = null;
+      _encodeMs = null;
     },
   };
 
