@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Main layout for FPV Quest viewer.
+
+    Layer order (bottom → top):
+      1. SurfaceViewRenderer  — fullscreen video (SurfaceView punches through)
+      2. overlay LinearLayout — server URL input + Connect button (hidden after connect)
+      3. status_text TextView — connection state strip at the bottom
+-->
+<FrameLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <!-- Video surface — must be the first child so overlay Views draw on top -->
+    <org.webrtc.SurfaceViewRenderer
+        android:id="@+id/surface_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- Connection overlay: shown on startup and after disconnect -->
+    <LinearLayout
+        android:id="@+id/overlay"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:orientation="vertical"
+        android:padding="24dp"
+        android:background="#99000000">
+
+        <EditText
+            android:id="@+id/url_input"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="ws://192.168.x.x:8080"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#888888"
+            android:background="#CC333333"
+            android:padding="10dp"
+            android:inputType="text"
+            android:singleLine="true"
+            android:imeOptions="actionDone"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/connect_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="12dp"
+            android:text="Connect" />
+
+    </LinearLayout>
+
+    <!-- Status strip at the bottom -->
+    <TextView
+        android:id="@+id/status_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:padding="8dp"
+        android:textColor="#FFFFFF"
+        android:textSize="12sp"
+        android:background="#80000000"
+        android:text="Ready" />
+
+</FrameLayout>

@@ -104,15 +104,17 @@ fpv-native-quest/                    # Android Studio project root
     └── src/main/
         ├── AndroidManifest.xml      # INTERNET, VR headtracking, landscape
         ├── java/com/fpv/quest/
-        │   ├── MainActivity.kt      # Activity-точка входа, TODO TASK-003/004
+        │   ├── MainActivity.kt      # URL input + Connect; WebRTCEngine+Signaling init; lifecycle; TODO TASK-004
         │   ├── SignalingClient.kt   # OkHttp WebSocket, протокол = server.js
-        │   ├── WebRTCEngine.kt      # PeerConnectionFactory + preferH264(), TODO TASK-003
-        │   └── FPVDataChannel.kt   # NTP clock sync + E2E, зеркало datachannel.js
+        │   ├── WebRTCEngine.kt      # PeerConnectionFactory + HardwareVideoDecoderFactory + полный PeerConnection.Observer
+        │   └── FPVDataChannel.kt   # NTP clock sync + E2E + bind(DataChannel); зеркало datachannel.js
         ├── cpp/
         │   ├── CMakeLists.txt       # libfpv-native.so, links EGL + GLESv3 + log
         │   ├── xr_renderer.cpp      # TODO TASK-004: OpenXR stereo rendering
         │   └── video_decoder.cpp    # TODO TASK-004: SurfaceTexture zero-copy
-        └── res/xml/network_security_config.xml  # ws:// cleartext для LAN
+        └── res/
+            ├── layout/activity_main.xml         # SurfaceViewRenderer + overlay + status strip
+            └── xml/network_security_config.xml  # ws:// cleartext для LAN
 ```
 
 ### Требования к окружению
@@ -164,8 +166,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 | JS (public/js/) | Kotlin (com/fpv/quest/) | Статус |
 |-----------------|------------------------|--------|
-| `webrtc-client.js` | `WebRTCEngine.kt` + `SignalingClient.kt` | TASK-003 |
-| `datachannel.js` | `FPVDataChannel.kt` | TASK-005 |
+| `webrtc-client.js` | `WebRTCEngine.kt` + `SignalingClient.kt` | ✅ TASK-003 |
+| `datachannel.js` | `FPVDataChannel.kt` | TASK-005 (bind готов, stats pending) |
 | `webxr-renderer.js` | `xr_renderer.cpp` (JNI) | TASK-004 |
 | `stats.js` | inline в `MainActivity.kt` | TASK-005 |
 
@@ -173,6 +175,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 - WebXR требует HTTPS (`TLS=1`), кроме случая `localhost`.
 - TLS-сертификаты должны находиться по путям `server/certs/key.pem` и `server/certs/cert.pem` до запуска с `TLS=1`. При их отсутствии сервер выводит ошибку и завершается.
+- Нативному приложению (`fpv-native-quest`) TLS не требуется — используй `ws://` с `npm start` (без TLS=1). Если нужен `wss://` (например, сервер уже запущен с TLS), `SignalingClient` принимает любой TLS-сертификат (trust-all TrustManager) — Quest 2 не поддерживает установку user CA-сертификатов через UI.
 - Сервер выставляет заголовки безопасности `Cross-Origin-Embedder-Policy: require-corp` и `Cross-Origin-Opener-Policy: same-origin` (нужно для SharedArrayBuffer).
 - STUN: `stun.l.google.com:19302`. TURN-сервер отсутствует — оба пира должны быть в одной LAN или иметь прямую связность.
 - Смещение глаз в `webxr-renderer.js` захардкожено (0.03 м на глаз), не учитывает перспективу.

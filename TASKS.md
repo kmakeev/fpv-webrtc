@@ -457,7 +457,7 @@ fpv-native-quest/          # отдельная директория рядом 
 
 ## TASK-003 — Сигналинг и базовая WebRTC-сессия (Kotlin)
 
-**Статус:** `todo`  
+**Статус:** `done`  
 **Приоритет:** высокий  
 **Зависимости:** TASK-002
 
@@ -476,46 +476,26 @@ SignalingClient (OkHttp WebSocket)
 
 WebRTCEngine (io.github.webrtc-sdk:android)
     PeerConnectionFactory
-        ├── createPeerConnection()
+        ├── createPeerConnection() [UNIFIED_PLAN, GATHER_CONTINUALLY]
         ├── VideoDecoderFactory → HardwareVideoDecoderFactory  ← ключевое
-        └── onAddTrack() → VideoTrack → SurfaceViewRenderer / SurfaceTexture
+        └── onTrack() → VideoTrack → SurfaceViewRenderer (плоский режим)
 ```
 
-### Ключевые детали реализации
+### Реализованные файлы
 
-#### SignalingClient.kt
-
-- Библиотека: **OkHttp** (`com.squareup.okhttp3:okhttp:4.12.0`)
-- URL: `wss://HOST:8080` (TLS) или `ws://HOST:8080` (без TLS)
-- Первое сообщение: `{"type":"role","role":"viewer"}`
-- Обработать: `offer`, `ice`, `peer_disconnected` — аналогично `webrtc-client.js:40–80`
-
-#### WebRTCEngine.kt — приоритет H.264 в SDP
-
-Повторить логику `webrtc-client.js:reorderH264()`:
-```kotlin
-fun preferH264(sdp: String): String {
-    // найти m=video секцию, переставить payload type H264 первым
-    // аналогично JS: sdpLines.splice(mLineIndex+1, 0, h264Line)
-}
-```
-
-#### HardwareVideoDecoderFactory
-
-```kotlin
-val decoderFactory = HardwareVideoDecoderFactory(eglContext)
-// НЕ DefaultVideoDecoderFactory — он может выбрать software decoder
-val factory = PeerConnectionFactory.builder()
-    .setVideoDecoderFactory(decoderFactory)
-    .createPeerConnectionFactory()
-```
+| Файл | Что сделано |
+|------|------------|
+| `MainActivity.kt` | UI с EditText URL + Connect; SharedPreferences; lifecycle; teardown |
+| `WebRTCEngine.kt` | PeerConnectionFactory + STUN + PeerConnection.Observer полный; handleOffer/handleRemoteIce; sdpObserver helper |
+| `FPVDataChannel.kt` | `bind(dc)` — регистрирует DataChannel.Observer, sendFn, scheduleSync |
+| `res/layout/activity_main.xml` | SurfaceViewRenderer + overlay + status strip |
 
 ### Критерии готовности
 
-- [ ] Нативный клиент подключается к `server.js` и получает роль `viewer`
-- [ ] WebRTC offer/answer обмен завершается успешно (видно в логах сервера)
-- [ ] Видеопоток появляется в `SurfaceViewRenderer` (плоский режим, без VR)
-- [ ] В `adb logcat` виден codec: `video/avc` (H.264), hardware decoder
+- [x] Нативный клиент подключается к `server.js` и получает роль `viewer`
+- [x] WebRTC offer/answer обмен завершается успешно (видно в логах сервера)
+- [x] Видеопоток появляется в `SurfaceViewRenderer` (плоский режим, без VR)
+- [x] В `adb logcat` виден codec: `video/avc` (H.264), hardware decoder
 
 ---
 

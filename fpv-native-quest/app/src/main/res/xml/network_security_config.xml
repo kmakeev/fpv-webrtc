@@ -1,16 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Allows cleartext (ws://, http://) traffic to LAN hosts for development.
-    In production (ws:// → wss://) this can be restricted to domain-config only.
-    See: docs/native-android-setup.md
+    Network security config for FPV Quest native app.
+
+    ws://  (cleartext) — works with any LAN IP, no TLS required.
+             Run server as: npm start  (no TLS=1)
+
+    wss:// (TLS) — works if the self-signed server cert is installed on Quest 2:
+             adb push server/certs/cert.pem /sdcard/fpv_cert.pem
+             then on Quest 2: Settings → Security → Install certificate → CA certificate
+
+    LAN IPs vary between networks, so we permit cleartext from all hosts here.
+    Restrict to specific domains in a production/release build.
 -->
 <network-security-config>
-    <!-- LAN / private IP ranges: allow ws:// for dev server -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="true">192.168.0.0</domain>
-        <domain includeSubdomains="true">192.168.1.0</domain>
-        <domain includeSubdomains="true">10.0.0.0</domain>
-        <domain includeSubdomains="true">172.16.0.0</domain>
-        <domain includeSubdomains="true">localhost</domain>
-    </domain-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system"/>
+            <!-- Trust user-installed certs — needed for wss:// with self-signed cert -->
+            <certificates src="user"/>
+        </trust-anchors>
+    </base-config>
 </network-security-config>

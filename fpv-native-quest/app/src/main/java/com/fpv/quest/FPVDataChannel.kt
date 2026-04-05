@@ -6,7 +6,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
-import kotlin.math.abs
+import org.webrtc.DataChannel
+import java.nio.ByteBuffer
 
 /**
  * DataChannel handler — Kotlin equivalent of public/js/datachannel.js.
@@ -25,15 +26,11 @@ import kotlin.math.abs
  *
  * E2E latency calculation:
  *   e2eMs = System.currentTimeMillis() - capture + clockOffset
- *
- * TASK-002: stubs + algorithm — no actual DataChannel object yet.
- * TODO TASK-003: wire pc.dataChannel / ondatachannel into accept().
  */
 class FPVDataChannel {
 
     companion object {
         private const val TAG = "FPVDataChannel"
-        private const val CHANNEL_NAME = "fpv"
         private const val SYNC_ROUNDS = 5
         private const val SYNC_STARTUP_DELAY_MS = 3_000L  // let jitter buffer stabilize
         private const val PING_INTERVAL_MS = 50L
@@ -55,23 +52,45 @@ class FPVDataChannel {
     /** Called on each "ts" message from the streamer. */
     var onTimestamp: ((captureMs: Long, encodeMs: Long) -> Unit)? = null
 
-    /**
-     * Subscribe to incoming DataChannel from the peer connection.
-     * TODO TASK-003: replace stub with real RTCDataChannel setup:
-     *
-     *   pc.addTransceiver(...)  // or ondatachannel callback
-     *   dataChannel.onMessage { handleMessage(it.data.string()) }
-     *   dataChannel.onOpen    { scheduleSync() }
-     */
-    fun accept(/* pc: PeerConnection */) {
-        Log.i(TAG, "accept() stub — TODO TASK-003: wire RTCDataChannel")
-    }
-
-    /** Send a JSON message over the DataChannel. */
+    /** Send a JSON message over the DataChannel. Set by bind(). */
     private var sendFn: ((String) -> Unit)? = null
 
     fun setSendFunction(fn: (String) -> Unit) {
         sendFn = fn
+    }
+
+    /**
+     * Wire a real org.webrtc.DataChannel into this handler.
+     * Called from WebRTCEngine.PeerConnection.Observer.onDataChannel().
+     *
+     * Mirrors datachannel.js _attachDc() — registers all callbacks and
+     * starts clock sync once the channel reaches OPEN state.
+     */
+    fun bind(dc: DataChannel) {
+        setSendFunction { json ->
+            // ByteBuffer.wrap() produces a buffer already in read mode (position=0, limit=length)
+            dc.send(DataChannel.Buffer(ByteBuffer.wrap(json.toByteArray(Charsets.UTF_8)), false))
+        }
+        dc.registerObserver(object : DataChannel.Observer {
+            override fun onStateChange() {
+                Log.d(TAG, "DataChannel state: ${dc.state()}")
+                when (dc.state()) {
+                    DataChannel.State.OPEN    -> scheduleSync()
+                    DataChannel.State.CLOSED,
+                    DataChannel.State.CLOSING -> sendFn = null
+                    else                      -> {}
+                }
+            }
+
+            override fun onMessage(buffer: DataChannel.Buffer) {
+                // SDK delivers buffer already flipped (position=0, limit=dataLength)
+                val bytes = ByteArray(buffer.data.remaining())
+                buffer.data.get(bytes)
+                handleMessage(String(bytes, Charsets.UTF_8))
+            }
+
+            override fun onBufferedAmountChange(previousAmount: Long) {}
+        })
     }
 
     /** Handle an incoming DataChannel message (JSON string). */
@@ -130,7 +149,10 @@ class FPVDataChannel {
                 put("type", "ping")
                 put("id", i)
                 put("t0", t0)
-            }.toString()) ?: Log.w(TAG, "sendFn not set — clock sync skipped")
+            }.toString()) ?: run {
+                Log.w(TAG, "sendFn not set — clock sync skipped")
+                return
+            }
 
             delay(PING_INTERVAL_MS * 4)   // wait for pong
         }

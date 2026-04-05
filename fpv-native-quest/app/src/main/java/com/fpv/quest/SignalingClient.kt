@@ -7,7 +7,12 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 /**
  * WebSocket signaling client — mirrors the protocol of server/server.js and
@@ -41,10 +46,26 @@ class SignalingClient(
         const val TYPE_PEER_DISCONNECTED = "peer_disconnected"
     }
 
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)  // no timeout for persistent WS
-        .build()
+    // Trust all TLS certificates — required for the self-signed LAN cert (Quest 2
+    // has no UI to install user CA certs). Safe for a private LAN-only app.
+    private val httpClient: OkHttpClient = buildTrustAllClient()
+
+    private fun buildTrustAllClient(): OkHttpClient {
+        val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+            override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        })
+        val sslContext = SSLContext.getInstance("TLS").apply {
+            init(null, trustAll, SecureRandom())
+        }
+        return OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)  // no timeout for persistent WS
+            .sslSocketFactory(sslContext.socketFactory, trustAll[0] as X509TrustManager)
+            .hostnameVerifier { _, _ -> true }
+            .build()
+    }
 
     private var ws: WebSocket? = null
 

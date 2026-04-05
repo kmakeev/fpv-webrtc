@@ -158,6 +158,49 @@ https://localhost:8080/streamer.html
 
 ---
 
+## Нативное приложение для Quest 2 (fpv-native-quest/)
+
+Вместо браузерного вьювера можно использовать нативный APK — он напрямую использует MediaCodec для декодирования H.264, что снизит E2E-задержку декода с ~38ms (браузерный MediaCodec pipeline) до целевых ~3–5ms (TASK-004).
+
+### Текущий статус
+
+| Задача | Статус | Что реализовано |
+|--------|--------|-----------------|
+| TASK-002 | ✅ | Скелет Android проекта |
+| TASK-003 | ✅ | WebRTC сигналинг + плоский видео-вьювер (SurfaceViewRenderer) |
+| TASK-004 | todo | OpenXR стерео-рендеринг (xr_renderer.cpp) |
+| TASK-005 | todo | E2E-статистика из нативного приложения |
+
+### Сборка и запуск
+
+**Требования:** JDK 17, Android SDK с NDK 27.x и CMake 3.22.1
+
+```bash
+cd fpv-native-quest/
+
+# Первый запуск
+cp local.properties.template local.properties
+# Прописать sdk.dir=/Users/<user>/Library/Android/sdk
+
+export JAVA_HOME=/opt/homebrew/opt/openjdk@17   # macOS Homebrew
+./gradlew assembleDebug                          # сборка APK
+./gradlew installDebug                           # сборка + установка на Quest 2
+
+# Запустить и смотреть логи
+adb shell am start -n com.fpv.quest/.MainActivity
+adb logcat -s FPVQuest WebRTCEngine SignalingClient FPVDataChannel
+```
+
+### Подключение
+
+1. Запусти сервер **без TLS**: `npm start`
+2. В приложении введи: `ws://192.168.x.x:8080` и нажми **Connect**
+3. Открой `http://192.168.x.x:8080/streamer.html` в браузере — видео появится на экране Quest
+
+> Если сервер запущен с `TLS=1`, вводи `wss://` — приложение принимает самоподписанный сертификат автоматически.
+
+---
+
 ## Диагностика
 
 ### Статус "Подключение..." не меняется
