@@ -102,22 +102,62 @@ button:not(:disabled):active { transform: scale(0.97); }
   font-size: 0.85em;
 }
 
-/* ── Оверлей в VR (HUD поверх картинки) ────────────────────────────────── */
-#vr-hud {
-  display: none;
+/* ── DOM Overlay корень (покрывает весь экран, прозрачный) ──────────────── */
+#xr-overlay {
   position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 30;
+  visibility: hidden;
+}
+#xr-overlay.active { visibility: visible; }
+
+/* ── VR HUD (поверх XR-сцены) ───────────────────────────────────────────── */
+#vr-hud {
+  position: absolute;
   top: 16px;
   left: 50%;
   transform: translateX(-50%);
-  background: rgba(0,0,0,0.6);
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(255,255,255,0.08);
   border-radius: 12px;
   padding: 8px 20px;
-  font-size: 0.75rem;
-  color: #aaa;
+  font-size: 0.78rem;
+  color: #ccc;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: center;
+}
+.vr-hud-row  { display: flex; gap: 8px; align-items: center; }
+.vr-hud-row2 { color: #888; font-size: 0.72rem; }
+.sep { color: #444; }
+
+/* ── Статистика поверх плоского видео ───────────────────────────────────── */
+#flat-stats {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.60);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 10px;
+  padding: 6px 18px;
+  font-size: 0.78rem;
+  color: #ccc;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
   z-index: 20;
   pointer-events: none;
-  font-variant-numeric: tabular-nums;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: center;
 }
+#flat-stats .fs-row  { display: flex; gap: 10px; }
+#flat-stats .fs-row2 { color: #777; font-size: 0.72rem; }
 
 /* ── Плоский видеоэкран (режим без VR) ─────────────────────────────────── */
 .flat-info {

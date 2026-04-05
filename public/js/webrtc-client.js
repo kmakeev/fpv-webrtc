@@ -37,6 +37,9 @@
     /** Получить входящий MediaStream (видео с ESP32 / ноутбука) */
     getStream() { return stream; },
 
+    /** Получить RTCPeerConnection для статистики */
+    getPeerConnection() { return pc; },
+
     /** Колбэки — задаются снаружи */
     onStatus:     () => {},   // (status: string, detail?: string) => void
     onStream:     () => {},   // (stream: MediaStream) => void

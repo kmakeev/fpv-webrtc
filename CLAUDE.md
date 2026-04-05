@@ -45,6 +45,22 @@ PORT=9090 docker compose --profile http up             # Изменить пор
 - **stats.js** — Опрашивает `RTCPeerConnection.getStats()` каждую секунду для отображения задержки, FPS, разрешения и кодека в UI.
 - **main.js** — Оркестрирует все модули. Управляет переходами состояний UI (connecting → waiting → streaming). Передаёт входящий MediaStream как на плоское видео, так и в WebXR-рендерер.
 
+## Статистика
+
+Модуль `stats.js` опрашивает `RTCPeerConnection.getStats()` каждую секунду и отображает:
+
+| Метрика | Источник |
+|---------|----------|
+| Сеть | RTT/2 из `candidate-pair.currentRoundTripTime` |
+| Декод | `totalDecodeTime / framesDecoded` за интервал |
+| Буфер | `jitterBufferDelay / jitterBufferEmittedCount` |
+| Итого | сумма трёх выше (задержка на стороне получателя) |
+
+Статистика выводится в трёх местах:
+- **Полоска** под кнопками — всегда при активном потоке
+- **Flat overlay** (`#flat-stats`) — поверх видео в режиме "Смотреть на экране"
+- **WebGL HUD** — квад в world-space поверх видео в VR-режиме (рендерится через те же XR view/projection матрицы, обновляется внутри XR-фрейма через `_uploadStatsTexture`)
+
 ## Ключевые технические ограничения
 
 - WebXR требует HTTPS (`TLS=1`), кроме случая `localhost`.

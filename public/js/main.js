@@ -14,6 +14,24 @@
   const btnFlat    = document.getElementById('btn-flat');
   const videoFlat  = document.getElementById('video-flat');
   const xrCanvas   = document.getElementById('xr-canvas');
+  const flatStats  = document.getElementById('flat-stats');
+  flatStats.innerHTML =
+    '<div class="fs-row">' +
+      '<span id="fs-net">Сеть: —</span>' +
+      '<span>·</span>' +
+      '<span id="fs-decode">Декод: —</span>' +
+      '<span>·</span>' +
+      '<span id="fs-jitter">Буфер: —</span>' +
+      '<span>·</span>' +
+      '<span id="fs-total">Итого: —</span>' +
+    '</div>' +
+    '<div class="fs-row fs-row2">' +
+      '<span id="fs-fps">—</span>' +
+      '<span>·</span>' +
+      '<span id="fs-res">—</span>' +
+      '<span>·</span>' +
+      '<span id="fs-codec">—</span>' +
+    '</div>';
 
   // ── Определяем адрес сервера ──────────────────────────────────────────────
   // Если открыто с ноутбука — ws://localhost:8080
@@ -86,14 +104,14 @@
     videoFlat.srcObject = stream;
     videoFlat.play().catch(console.warn);
 
-    // Получаем RTCPeerConnection для статистики
-    // (доступ через внутренний объект клиента)
-    // В реальном проекте — передавать через FPVClient.getPeerConnection()
+    // Запускаем сбор статистики
+    FPVStats.start(FPVClient.getPeerConnection());
   };
 
   FPVClient.onDisconnect = () => {
     FPVStats.stop();
     videoFlat.srcObject = null;
+    flatStats.style.display = 'none';
     if (mode === 'flat') {
       videoFlat.style.display = 'none';
       ui.classList.remove('hidden');
@@ -141,14 +159,15 @@
     if (!stream) return;
 
     if (mode === 'flat') {
-      // Скрыть плоское видео
       videoFlat.style.display = 'none';
+      flatStats.style.display  = 'none';
       ui.classList.remove('hidden');
       mode = 'none';
       btnFlat.textContent = 'Смотреть на экране';
     } else {
       videoFlat.srcObject = stream;
       videoFlat.style.display = 'block';
+      flatStats.style.display  = 'flex';
       ui.classList.add('hidden');
       mode = 'flat';
       btnFlat.textContent = '← Назад';

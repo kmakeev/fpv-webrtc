@@ -33,6 +33,9 @@
   </div>
 </div>
 
+<!-- ══ Статистика поверх плоского видео ══════════════════════════════════════ -->
+<div id="flat-stats" style="display:none"></div>
+
 <!-- ══ Видео-элементы ════════════════════════════════════════════════════════ -->
 <!-- Плоский просмотр (fallback) -->
 <video id="video-flat" autoplay playsinline muted style="display:none;
@@ -42,6 +45,28 @@
 <!-- WebXR canvas -->
 <canvas id="xr-canvas" style="display:none;position:fixed;top:0;left:0;
   width:100%;height:100%;background:#000;z-index:0;"></canvas>
+
+<!-- ══ DOM Overlay для VR HUD (показывается поверх XR-сцены) ════════════════ -->
+<div id="xr-overlay">
+  <div id="vr-hud">
+    <div class="vr-hud-row">
+      <span id="vr-net">Сеть: —</span>
+      <span class="sep">·</span>
+      <span id="vr-decode">Декод: —</span>
+      <span class="sep">·</span>
+      <span id="vr-jitter">Буфер: —</span>
+      <span class="sep">·</span>
+      <span id="vr-total">Итого: —</span>
+    </div>
+    <div class="vr-hud-row vr-hud-row2">
+      <span id="vr-fps">—</span>
+      <span class="sep">·</span>
+      <span id="vr-res">—</span>
+      <span class="sep">·</span>
+      <span id="vr-codec">—</span>
+    </div>
+  </div>
+</div>
 
 <script src="js/webrtc-client.js"></script>
 <script src="js/webxr-renderer.js"></script>
