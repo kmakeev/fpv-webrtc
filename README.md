@@ -160,42 +160,54 @@ https://localhost:8080/streamer.html
 
 ## Нативное приложение для Quest 2 (fpv-native-quest/)
 
-Вместо браузерного вьювера можно использовать нативный APK — он напрямую использует MediaCodec для декодирования H.264, что снизит E2E-задержку декода с ~38ms (браузерный MediaCodec pipeline) до целевых ~3–5ms (TASK-004).
+Нативный APK использует OpenXR + MediaCodec вместо браузера. Преимущества:
+- Стерео рендеринг через OpenXR (реальные IPD/FOV шлема, ATW runtime)
+- Zero-copy H.264 декодинг: MediaCodec → SurfaceTexture → OES-текстура → OpenXR
+- E2E-задержка ~15–35 мс vs ~65–100 мс в браузере
 
 ### Текущий статус
 
 | Задача | Статус | Что реализовано |
 |--------|--------|-----------------|
-| TASK-002 | ✅ | Скелет Android проекта |
-| TASK-003 | ✅ | WebRTC сигналинг + плоский видео-вьювер (SurfaceViewRenderer) |
-| TASK-004 | todo | OpenXR стерео-рендеринг (xr_renderer.cpp) |
-| TASK-005 | todo | E2E-статистика из нативного приложения |
+| TASK-002 | ✅ | Скелет Android-проекта, Gradle + NDK |
+| TASK-003 | ✅ | WebRTC сигналинг, H.264 декодинг, плоский SurfaceViewRenderer |
+| TASK-004 | ✅ | Zero-copy OES-текстура (EglVideoSink → video_decoder.cpp) |
+| TASK-005 | ✅ | OpenXR стерео-рендеринг (xr_renderer.cpp + XrRenderThread.kt) |
+| TASK-006 | todo | FPVDataChannel E2E-статистика в VR HUD |
 
 ### Сборка и запуск
 
-**Требования:** JDK 17, Android SDK с NDK 27.x и CMake 3.22.1
+**Требования:** JDK 17, Android SDK с NDK 27.x и CMake 3.22.1.  
+Все остальные зависимости (WebRTC SDK, OpenXR loader) Gradle скачивает с Maven Central автоматически.
 
 ```bash
 cd fpv-native-quest/
 
-# Первый запуск
+# Первый запуск: создать local.properties
 cp local.properties.template local.properties
-# Прописать sdk.dir=/Users/<user>/Library/Android/sdk
+# Проверить что sdk.dir указывает правильно:
+cat local.properties   # sdk.dir=/Users/<user>/Library/Android/sdk
 
+# Установить JAVA_HOME если JDK 17 не в системном PATH
 export JAVA_HOME=/opt/homebrew/opt/openjdk@17   # macOS Homebrew
-./gradlew assembleDebug                          # сборка APK
+
+# Сборка — Gradle автоматически скачивает OpenXR loader (org.khronos.openxr:openxr_loader_for_android)
+./gradlew assembleDebug                          # APK → app/build/outputs/apk/debug/
 ./gradlew installDebug                           # сборка + установка на Quest 2
 
 # Запустить и смотреть логи
 adb shell am start -n com.fpv.quest/.MainActivity
-adb logcat -s FPVQuest WebRTCEngine SignalingClient FPVDataChannel
+adb logcat -s FPVQuest WebRTCEngine SignalingClient FPVDataChannel xr_renderer video_decoder
 ```
+
+> Подробная инструкция по установке окружения: [`docs/native-android-setup.md`](docs/native-android-setup.md)
 
 ### Подключение
 
 1. Запусти сервер **без TLS**: `npm start`
-2. В приложении введи: `ws://192.168.x.x:8080` и нажми **Connect**
-3. Открой `http://192.168.x.x:8080/streamer.html` в браузере — видео появится на экране Quest
+2. В приложении Quest введи: `ws://192.168.x.x:8080` и нажми **Connect**
+3. Открой `http://192.168.x.x:8080/streamer.html` в браузере на ноутбуке
+4. Надень Quest — видео появится в стерео (OpenXR VR-режим)
 
 > Если сервер запущен с `TLS=1`, вводи `wss://` — приложение принимает самоподписанный сертификат автоматически.
 

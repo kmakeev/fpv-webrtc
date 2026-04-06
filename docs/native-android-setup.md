@@ -2,6 +2,24 @@
 
 Руководство по установке всех компонентов, необходимых для сборки `fpv-native-quest/`.
 
+## Зависимости проекта
+
+| Зависимость | Откуда берётся | Ручная установка |
+|-------------|---------------|-----------------|
+| JDK 17 | `brew install openjdk@17` | Шаг 1 |
+| Android NDK 27.x | Android Studio SDK Manager | Шаг 2 |
+| CMake 3.22.1 | Android Studio SDK Manager | Шаг 2 |
+| Android API 32 | Android Studio SDK Manager | Шаг 3 |
+| `io.github.webrtc-sdk:android:125.6422.07` | Maven Central — скачивается Gradle автоматически | — |
+| `com.squareup.okhttp3:okhttp:4.12.0` | Maven Central — скачивается Gradle автоматически | — |
+| `org.khronos.openxr:openxr_loader_for_android:1.1.49` | Maven Central — скачивается Gradle автоматически | — |
+
+> **OpenXR loader** (`libopenxr_loader.so` + хедеры) поставляется как Prefab AAR с Maven Central.
+> Gradle скачивает его автоматически при первой сборке — отдельных шагов не требует.
+> Для автодополнения хедеров в IDE запусти `./setup-openxr.sh` (опционально, см. Шаг 5.5).
+
+---
+
 ## Проверка текущего состояния
 
 ```bash
@@ -132,23 +150,47 @@ cd /путь/к/fpv-webrtc/fpv-native-quest/
 
 # Создать local.properties (не коммитится, в .gitignore)
 cp local.properties.template local.properties
-# Отредактировать sdk.dir:
-echo 'sdk.dir=/Users/konstantin/Library/Android/sdk' >> local.properties
+# Убедиться что sdk.dir указывает на правильный путь:
+cat local.properties   # sdk.dir=/Users/<user>/Library/Android/sdk
+
+# Установить JAVA_HOME если JDK 17 не в системном PATH
+export JAVA_HOME=/opt/homebrew/opt/openjdk@17   # macOS Homebrew
 
 # Собрать debug APK
+# Gradle автоматически скачает все зависимости с Maven Central,
+# включая OpenXR loader (org.khronos.openxr:openxr_loader_for_android:1.1.49)
 ./gradlew assembleDebug
 ```
 
 Успешный вывод:
 ```
 BUILD SUCCESSFUL in 2m 30s
-35 actionable tasks: 35 executed
+38 actionable tasks: 38 executed
 ```
 
 APK создан по пути:
 ```
 app/build/outputs/apk/debug/app-debug.apk
 ```
+
+---
+
+## Шаг 5.5 — Хедеры OpenXR для IDE (опционально)
+
+Gradle и CMake находят хедеры OpenXR автоматически через Prefab AAR. Этот шаг нужен
+только если IDE (CLion, Android Studio) не индексирует хедеры из кешированного AAR.
+
+```bash
+cd fpv-native-quest/
+./setup-openxr.sh
+```
+
+Скрипт скачивает хедеры Khronos OpenXR SDK в `third_party/openxr/include/openxr/`.
+После этого перезапустить индексацию: **File → Sync Project with Gradle Files**.
+
+> Версию OpenXR можно найти в `app/build.gradle` →
+> `org.khronos.openxr:openxr_loader_for_android:<version>`.
+> Актуальные релизы: https://github.com/KhronosGroup/OpenXR-SDK-Source/releases
 
 ---
 
@@ -200,13 +242,17 @@ adb logcat -c && adb logcat -s FPVQuest
 
 | Ошибка | Причина | Решение |
 |--------|---------|---------|
-| `No JDK found` | JDK 17 не установлен | Шаг 1 |
+| `No JDK found` / `Unable to locate a Java Runtime` | JDK 17 не в PATH | `export JAVA_HOME=/opt/homebrew/opt/openjdk@17` |
 | `NDK not configured` | NDK не установлен | Шаг 2 |
 | `Cmake '3.22.1' was not found` | CMake не установлен | Шаг 2 |
 | `SDK location not found` | `local.properties` отсутствует | Шаг 5 |
+| `Could not resolve org.khronos.openxr:openxr_loader_for_android` | Нет доступа к Maven Central | Проверить интернет-соединение; убедиться что `mavenCentral()` есть в `settings.gradle` |
+| `Package openxr not found` (CMake) | Prefab не активирован | Убедиться что `buildFeatures { prefab true }` есть в `app/build.gradle` |
+| `xrInitializeLoaderKHR not found` (runtime) | `libopenxr_loader.so` не в APK | Проверить что зависимость `openxr_loader_for_android` есть в `build.gradle` |
 | `INSTALL_FAILED_USER_RESTRICTED` | Developer Mode выключен | Шаг 4.1 |
 | `INSTALL_FAILED_VERSION_DOWNGRADE` | Более новая версия установлена | `adb uninstall com.fpv.quest` |
 | `error: no devices/emulators found` | Quest не подключён или не авторизован | Шаг 4.2 |
+| Приложение запускается в 2D-панели VR (не в иммерсивном режиме) | Нет `com.oculus.intent.category.VR` или `focusaware` в манифесте | Уже прописаны в `AndroidManifest.xml` — пересобери APK |
 
 ---
 
@@ -229,10 +275,34 @@ curl -L -o gradle/wrapper/gradle-wrapper.jar \
 
 ---
 
+## Статус задач
+
+| Задача | Статус | Что реализовано |
+|--------|--------|-----------------|
+| TASK-002 | ✅ | Скелет Android-проекта, Gradle + NDK |
+| TASK-003 | ✅ | WebRTC сигналинг, H.264 декодинг, плоский SurfaceViewRenderer |
+| TASK-004 | ✅ | Zero-copy OES-текстура (EglVideoSink + video_decoder.cpp, glFlush) |
+| TASK-005 | ✅ | OpenXR стерео-рендеринг (xr_renderer.cpp, XrRenderThread.kt, samplerExternalOES) |
+| TASK-006 | todo | FPVDataChannel E2E-статистика в VR HUD |
+
 ## Следующие шаги
 
-После успешной сборки и установки (чёрный экран в шлеме = TASK-002 выполнена):
+После успешной сборки:
 
-- **TASK-003** — SignalingClient + WebRTCEngine: первый видеопоток в шлеме
-- **TASK-004** — OpenXR + xr_renderer: стерео VR рендеринг
-- **TASK-005** — FPVDataChannel: E2E метрики из нативного приложения
+```bash
+# Запустить сервер без TLS (нативному приложению TLS не нужен)
+cd fpv-webrtc/
+npm start
+
+# На Quest 2 ввести ws://IP_ноутбука:8080 и нажать Connect
+# Видео появится в VR (стерео, OpenXR) и одновременно на SurfaceViewRenderer (плоско)
+
+# Проверить OpenXR лог:
+adb logcat -s xr_renderer video_decoder XrRenderThread
+# Ожидаемый вывод:
+# xr_renderer: nativeInitXR()
+# xr_renderer: OpenXR loader initialized
+# xr_renderer: XrInstance created
+# xr_renderer: XrSession created
+# xr_renderer: Session running
+```

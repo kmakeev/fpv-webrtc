@@ -104,15 +104,17 @@ fpv-native-quest/                    # Android Studio project root
     └── src/main/
         ├── AndroidManifest.xml      # INTERNET, VR headtracking, landscape
         ├── java/com/fpv/quest/
-        │   ├── MainActivity.kt      # URL input + Connect; WebRTCEngine+Signaling init; lifecycle; TODO TASK-005
+        │   ├── MainActivity.kt      # URL input + Connect; WebRTCEngine+Signaling init; lifecycle; XrRenderThread
         │   ├── SignalingClient.kt   # OkHttp WebSocket, протокол = server.js
         │   ├── WebRTCEngine.kt      # PeerConnectionFactory + HardwareVideoDecoderFactory + полный PeerConnection.Observer
         │   ├── EglVideoSink.kt      # TASK-004: VideoSink → извлекает TextureBuffer(OES) → JNI nativeUpdateVideoFrame
-        │   └── FPVDataChannel.kt   # NTP clock sync + E2E + bind(DataChannel); зеркало datachannel.js
+        │   ├── FPVDataChannel.kt    # NTP clock sync + E2E + bind(DataChannel); зеркало datachannel.js
+        │   └── XrRenderThread.kt   # TASK-005: dedicated thread, shared EGL context, XR frame loop
         ├── cpp/
-        │   ├── CMakeLists.txt       # libfpv-native.so, links EGL + GLESv3 + log + mediandk
-        │   ├── xr_renderer.cpp      # TODO TASK-005: OpenXR stereo rendering
-        │   └── video_decoder.cpp    # TASK-004: OES texture globals (g_videoTexId, g_stMatrix)
+        │   ├── CMakeLists.txt       # libfpv-native.so, links EGL + GLESv3 + log + mediandk + openxr_loader (Prefab)
+        │   ├── video_state.h        # TASK-005: non-JNI accessors for OES texture (videostate_getTexId/Matrix)
+        │   ├── xr_renderer.cpp      # TASK-005: OpenXR 1.0 session + stereo rendering + samplerExternalOES shader
+        │   └── video_decoder.cpp    # TASK-004: OES texture globals (g_videoTexId, g_stMatrix) + glFlush
         └── res/
             ├── layout/activity_main.xml         # SurfaceViewRenderer + overlay + status strip
             └── xml/network_security_config.xml  # ws:// cleartext для LAN
@@ -138,7 +140,11 @@ cd fpv-native-quest/
 cp local.properties.template local.properties
 # Отредактировать sdk.dir → /Users/konstantin/Library/Android/sdk
 
+# Установить JAVA_HOME если JDK 17 не в PATH (macOS Homebrew)
+export JAVA_HOME=/opt/homebrew/opt/openjdk@17
+
 # Сборка debug APK
+# Gradle автоматически скачивает OpenXR loader с Maven Central при первой сборке
 ./gradlew assembleDebug
 # APK: app/build/outputs/apk/debug/app-debug.apk
 
@@ -162,16 +168,17 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | `io.github.webrtc-sdk:android` | 125.6422.07 | Google pre-built libwebrtc: PeerConnectionFactory, HardwareVideoDecoderFactory, DataChannel |
 | `com.squareup.okhttp3:okhttp` | 4.12.0 | WebSocket для сигналинга |
 | `kotlinx-coroutines-android` | 1.8.0 | Async clock sync, WebSocket callbacks |
+| `org.khronos.openxr:openxr_loader_for_android` | 1.1.49 | Khronos OpenXR loader (libopenxr_loader.so + хедеры) — Maven Central, Prefab AAR; CMake таргет `OpenXR::openxr_loader` |
 
-### Соответствие JS ↔ Kotlin модулей
+### Соответствие JS ↔ Kotlin/C++ модулей
 
-| JS (public/js/) | Kotlin (com/fpv/quest/) | Статус |
-|-----------------|------------------------|--------|
+| JS (public/js/) | Kotlin / C++ (com/fpv/quest/ + cpp/) | Статус |
+|-----------------|--------------------------------------|--------|
 | `webrtc-client.js` | `WebRTCEngine.kt` + `SignalingClient.kt` | ✅ TASK-003 |
-| `datachannel.js` | `FPVDataChannel.kt` | TASK-005 (bind готов, stats pending) |
+| `datachannel.js` | `FPVDataChannel.kt` | ✅ TASK-005 (bind + clock sync; E2E в status bar) |
 | *(нет аналога)* | `EglVideoSink.kt` + `video_decoder.cpp` | ✅ TASK-004 |
-| `webxr-renderer.js` | `xr_renderer.cpp` (JNI) | TASK-005 |
-| `stats.js` | inline в `MainActivity.kt` | TASK-005 |
+| `webxr-renderer.js` | `xr_renderer.cpp` + `XrRenderThread.kt` | ✅ TASK-005 |
+| `stats.js` | inline в `MainActivity.kt` | ✅ TASK-005 (basic E2E display) |
 
 ## Ключевые технические ограничения
 
@@ -186,3 +193,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - Стример (`streamer.html`) отправляет `type:'ts'` с `capture = encode = Date.now()` — энкод-задержка вебкамеры в браузере недоступна; для ESP32-P4 это поле будет содержать реальное время H.264-кодирования.
 - Метка времени захвата (`capture`) — `Date.now()` в момент отправки `ts`-сообщения, не RTP-timestamp.
 - `totalDecodeTime` на Android/Quest включает async MediaCodec pipeline latency (~38ms), а не только декодирование (~2ms). `requestVideoFrameCallback.processingDuration` возвращает ту же величину — rVFC отклонён (добавляет нагрузку без улучшения точности).
+- OpenXR loader (`libopenxr_loader.so`) поставляется через Meta Maven Prefab AAR (`com.meta.xr.sdk.openxr:openxr-android-loader:74.0.0`). Gradle скачивает его автоматически, CMake получает через `find_package(openxr)`. Для IDE-автодополнения хедеров запусти `./fpv-native-quest/setup-openxr.sh`.
+- OES-текстура из WebRTC (`g_videoTexId`) доступна в XR render thread через shared EGL context (`EglBase.create(eglBase.eglBaseContext)`). `video_decoder.cpp` вызывает `glFlush()` после каждого обновления текстуры для cross-context видимости на Adreno (Quest 2).
+- `XrRenderThread` стартует в `onResume()` и останавливается в `onPause()`. `nativeRenderFrame()` блокируется внутри `xrWaitFrame()` (~13.9 мс при 72 Гц) — дополнительный sleep не нужен. Для graceful exit вызывается `xrRequestExitSession()`.
+- Манифест должен содержать `<category android:name="com.oculus.intent.category.VR" />` и `<meta-data android:name="com.oculus.vr.focusaware" android:value="true" />` — без этого приложение работает в 2D-панели VR shell, а не в иммерсивном XR-режиме.
+- Шейдер использует `samplerExternalOES` + `GL_OES_EGL_image_external_essl3`. ST-матрица (3×3, row-major из Android) передаётся в GLSL с `glUniformMatrix3fv(..., GL_TRUE, ...)` (transpose=true). IPD и FOV берутся из `XrView` (реальные значения шлема), расстояние 1.5 м и ширина экрана 2.0 м совпадают с `webxr-renderer.js`.

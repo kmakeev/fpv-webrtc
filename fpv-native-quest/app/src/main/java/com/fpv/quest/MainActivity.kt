@@ -17,12 +17,13 @@ import org.webrtc.SurfaceViewRenderer
  * Entry point for the FPV Quest native app.
  *
  * Flat (non-VR) mode: video renders on SurfaceViewRenderer, status in a text strip.
+ * VR mode: OpenXR stereo rendering via XrRenderThread (TASK-005).
+ *
  * The server URL is persisted in SharedPreferences so it survives restarts.
  *
  * TASK-003: SignalingClient + WebRTCEngine + flat SurfaceViewRenderer.
  * TASK-004: EglVideoSink + zero-copy OES texture path wired to native code.
- * TODO TASK-005: initialize OpenXR session and xr_renderer for stereo display.
- * TODO TASK-005: wire dataChannel.onClockSynced / onTimestamp into the stats overlay.
+ * TASK-005: XrRenderThread + OpenXR stereo rendering; DataChannel E2E stats.
  */
 class MainActivity : Activity() {
 
@@ -55,12 +56,33 @@ class MainActivity : Activity() {
 
         // ── JNI — xr_renderer.cpp (TASK-005) ──────────────────────────────────
 
-        @JvmStatic external fun nativeInitXR()
-        @JvmStatic external fun nativeRenderFrame()
+        /**
+         * Initialize OpenXR instance, session, swapchains, and GL shaders.
+         * Must be called from XrRenderThread with a shared EGL context current.
+         * @param activity  The MainActivity instance (for XrInstanceCreateInfoAndroidKHR).
+         * @return true on success.
+         */
+        @JvmStatic external fun nativeInitXR(activity: Activity): Boolean
+
+        /**
+         * Render one stereo frame.
+         * Blocks on xrWaitFrame() for natural pacing (~13.9 ms at 72 Hz).
+         * @return true  keep running; false  session exiting (stop the render loop).
+         */
+        @JvmStatic external fun nativeRenderFrame(): Boolean
+
+        /**
+         * Request the XR session to exit, unblocking a pending xrWaitFrame().
+         * Safe to call even if the session is not running.
+         */
+        @JvmStatic external fun nativeRequestExitSession()
+
+        /** Destroy the XR session and release all native resources. */
         @JvmStatic external fun nativeDestroyXR()
     }
 
-    // EGL context shared between HardwareVideoDecoderFactory and SurfaceViewRenderer
+    // EGL context shared between HardwareVideoDecoderFactory, SurfaceViewRenderer,
+    // and XrRenderThread (via EglBase.create(eglBase.eglBaseContext)).
     private lateinit var eglBase: EglBase
 
     // Views
@@ -75,6 +97,9 @@ class MainActivity : Activity() {
     private var signaling: SignalingClient? = null
     private var eglVideoSink: EglVideoSink? = null
 
+    // OpenXR render thread (TASK-005)
+    private var xrThread: XrRenderThread? = null
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -83,10 +108,10 @@ class MainActivity : Activity() {
 
         Log.i(TAG, "onCreate")
 
-        // 1. EGL context — shared between decoder and renderer
+        // 1. EGL context — shared between decoder, renderer, and XrRenderThread
         eglBase = EglBase.create()
 
-        // 2. Video renderer
+        // 2. Video renderer (flat mode — also active in VR, Quest compositor ignores it)
         renderer = findViewById(R.id.surface_view)
         renderer.init(eglBase.eglBaseContext, null)
         renderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
@@ -105,7 +130,6 @@ class MainActivity : Activity() {
         // 5. Connect button
         connectButton.setOnClickListener { startConnection() }
 
-        // Allow "Done" on the keyboard to also trigger connect
         urlInput.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_DONE) {
                 startConnection()
@@ -117,11 +141,21 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         Log.d(TAG, "onResume")
+
+        // Start the OpenXR render thread (if not already running).
+        // The XR session lifecycle (IDLE→READY→FOCUSED) is driven by the runtime;
+        // the thread starts polling events immediately and begins rendering when
+        // the headset is worn and the app is focused.
+        if (xrThread == null) {
+            xrThread = XrRenderThread(this, eglBase.eglBaseContext).also { it.start() }
+            Log.i(TAG, "XrRenderThread started")
+        }
     }
 
     override fun onPause() {
         super.onPause()
         Log.d(TAG, "onPause")
+        stopXrThread()
     }
 
     override fun onDestroy() {
@@ -130,6 +164,17 @@ class MainActivity : Activity() {
         teardown()
         renderer.release()   // must precede eglBase.release()
         eglBase.release()
+    }
+
+    // ── OpenXR render thread management ─────────────────────────────────────
+
+    private fun stopXrThread() {
+        xrThread?.let { t ->
+            t.stopRendering()
+            t.join(3000)
+            if (t.isAlive) Log.w(TAG, "XrRenderThread did not stop within 3 s")
+        }
+        xrThread = null
     }
 
     // ── Connection management ─────────────────────────────────────────────────
@@ -154,8 +199,6 @@ class MainActivity : Activity() {
         teardown()
 
         // Init the WebRTC stack.
-        // PeerConnectionFactory.initialize() (with field trials) is called once
-        // inside WebRTCEngine.init() — do NOT call it again here without field trials.
         engine = WebRTCEngine()
         engine!!.init(this, eglBase)
 
@@ -165,9 +208,15 @@ class MainActivity : Activity() {
             nativeUpdateVideoFrame(texId, matrix)
         }
 
-        // TODO TASK-005: wire clock sync and E2E timestamps into a stats overlay
-        // engine!!.dataChannel.onClockSynced = { offsetMs -> ... }
-        // engine!!.dataChannel.onTimestamp   = { capture, encode -> ... }
+        // Wire DataChannel callbacks for clock sync + E2E stats display
+        engine!!.dataChannel.onClockSynced = { offsetMs ->
+            Log.i(TAG, "Clock sync complete: offset=${offsetMs}ms")
+        }
+        engine!!.dataChannel.onTimestamp = { capture, encode ->
+            val e2eMs = engine!!.dataChannel.computeE2E(capture)
+            val encMs = encode - capture
+            runOnUiThread { setStatus("E2E: ${e2eMs}ms  enc: ${encMs}ms") }
+        }
 
         // Build SignalingClient with callbacks that delegate to the engine
         signaling = SignalingClient(

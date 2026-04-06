@@ -27,6 +27,7 @@
 #include <cstring>         // memcpy
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
+#include "video_state.h"
 
 #define LOG_TAG "video_decoder"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -104,6 +105,10 @@ Java_com_fpv_quest_MainActivity_nativeUpdateVideoFrame(JNIEnv* env, jobject /*th
         }
     }
 
+    // Flush GPU commands so the OES texture is visible to other EGL contexts
+    // in the same share group (xr_renderer's render thread on Adreno/Quest 2).
+    glFlush();
+
     uint64_t n = ++g_frameCount;
     if (n == 1 || (n % 300) == 0) {
         LOGI("zero-copy frame #%llu: OES tex=%u", (unsigned long long)n, static_cast<GLuint>(textureId));
@@ -138,3 +143,14 @@ Java_com_fpv_quest_MainActivity_nativeGetVideoTransformMatrix(JNIEnv* env, jobje
 }
 
 } // extern "C"
+
+// ── Non-JNI accessors for xr_renderer.cpp ─────────────────────────────────────
+
+GLuint videostate_getTexId() {
+    return g_videoTexId.load();
+}
+
+void videostate_getMatrix(float out[9]) {
+    std::lock_guard<std::mutex> lock(g_matMutex);
+    memcpy(out, g_stMatrix, 9 * sizeof(float));
+}

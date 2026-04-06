@@ -11,6 +11,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // Meta XR SDK Maven repository — fallback if Khronos package is unavailable
+        // maven { url = uri("https://sdk.developer.oculus.com/maven2/") }
     }
 }
 

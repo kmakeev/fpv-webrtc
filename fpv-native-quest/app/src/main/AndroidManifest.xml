@@ -39,10 +39,23 @@
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-                <!-- TV/Quest launcher category -->
+                <!-- Standard Android launcher -->
                 <category android:name="android.intent.category.LAUNCHER" />
+                <!-- Quest / Horizon OS VR launcher -->
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                <!-- Meta VR category — activates immersive VR mode (OpenXR) -->
+                <category android:name="com.oculus.intent.category.VR" />
             </intent-filter>
+
+            <!--
+                focusaware=true: required for OpenXR XR_SESSION_STATE_FOCUSED.
+                Without this the runtime keeps the session in VISIBLE state and
+                controller/hand input is not delivered to the app.
+            -->
+            <meta-data
+                android:name="com.oculus.vr.focusaware"
+                android:value="true" />
+
         </activity>
 
     </application>
