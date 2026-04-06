@@ -26,7 +26,7 @@ import org.webrtc.VideoTrack
  *   - Create RTCPeerConnection with STUN config (UNIFIED_PLAN)
  *   - Handle offer/answer/ICE exchange via SignalingClient
  *   - Reorder SDP to prefer H.264 in the answer (same logic as webrtc-client.js reorderH264)
- *   - Add VideoTrack sink for rendering (SurfaceViewRenderer)
+ *   - Add VideoTrack sinks for rendering (SurfaceViewRenderer + EglVideoSink)
  *   - Wire incoming DataChannel into FPVDataChannel
  */
 class WebRTCEngine {
@@ -40,6 +40,7 @@ class WebRTCEngine {
     private var pc: PeerConnection? = null
     private var videoTrackRef: VideoTrack? = null
     private var videoSinkRef: VideoSink? = null
+    private var eglVideoSinkRef: EglVideoSink? = null
 
     /** Owns the FPVDataChannel instance; bound once the peer sends a DataChannel. */
     val dataChannel = FPVDataChannel()
@@ -50,15 +51,18 @@ class WebRTCEngine {
      * Initialize PeerConnectionFactory with HardwareVideoDecoderFactory.
      * Must be called before start(). eglBase is shared with SurfaceViewRenderer.
      *
-     * PeerConnectionFactory.initialize() is idempotent — safe to call multiple times.
+     * PeerConnectionFactory.initialize() is called exactly once here with
+     * all required field trials.  Do NOT call it separately before init().
      */
     fun init(context: Context, eglBase: EglBase) {
         PeerConnectionFactory.initialize(
             PeerConnectionFactory.InitializationOptions.builder(context)
+                // Minimise jitter-buffer playout delay — reduces buffering latency.
+                .setFieldTrials("WebRTC-MinPlayoutDelay/Enabled/")
                 .createInitializationOptions()
         )
         // HardwareVideoDecoderFactory uses MediaCodec + the shared EGL context so the
-        // decoded frame goes directly to the GPU without a CPU copy.
+        // decoded frame goes directly to the GPU without a CPU copy (TASK-004).
         // Do NOT use DefaultVideoDecoderFactory — it may select a software decoder.
         val decoderFactory = HardwareVideoDecoderFactory(eglBase.eglBaseContext)
 
@@ -67,23 +71,26 @@ class WebRTCEngine {
             // No encoder factory — this is a receive-only viewer.
             .createPeerConnectionFactory()
 
-        Log.i(TAG, "PeerConnectionFactory initialized (HardwareVideoDecoder)")
+        Log.i(TAG, "PeerConnectionFactory initialized (HardwareVideoDecoder, MinPlayoutDelay)")
     }
 
     /**
      * Create the RTCPeerConnection and wire all callbacks.
      * Must be called after init().
      *
-     * @param signaling  used to send answer and local ICE candidates
-     * @param videoSink  SurfaceViewRenderer (or any VideoSink) that receives decoded frames
-     * @param onStatus   called on connection state changes (arrives on WebRTC thread — dispatch to UI yourself)
+     * @param signaling    used to send answer and local ICE candidates
+     * @param videoSink    SurfaceViewRenderer (or any VideoSink) that receives decoded frames
+     * @param eglVideoSink optional zero-copy OES sink (TASK-004); added as a second VideoSink
+     * @param onStatus     called on connection state changes (arrives on WebRTC thread — dispatch to UI yourself)
      */
     fun start(
         signaling: SignalingClient,
         videoSink: VideoSink,
+        eglVideoSink: EglVideoSink? = null,
         onStatus: (String) -> Unit
     ) {
-        videoSinkRef = videoSink
+        videoSinkRef    = videoSink
+        eglVideoSinkRef = eglVideoSink
 
         val iceServers = listOf(
             PeerConnection.IceServer.builder(STUN_SERVER).createIceServer()
@@ -127,7 +134,9 @@ class WebRTCEngine {
                 if (track.kind() == MediaStreamTrack.VIDEO_TRACK_KIND) {
                     videoTrackRef = track as VideoTrack
                     videoTrackRef!!.addSink(videoSink)
-                    Log.i(TAG, "VideoTrack attached to sink")
+                    // Zero-copy OES sink: intercepts TextureBuffer frames for native renderer.
+                    eglVideoSink?.let { videoTrackRef!!.addSink(it) }
+                    Log.i(TAG, "VideoTrack attached to sink(s): renderer + ${if (eglVideoSink != null) "EglVideoSink" else "none"}")
                 }
             }
 
@@ -214,10 +223,12 @@ class WebRTCEngine {
     }
 
     fun close() {
-        // Remove sink before disposing to prevent a crash in some SDK versions
+        // Remove sinks before disposing to prevent a crash in some SDK versions
         videoTrackRef?.removeSink(videoSinkRef)
-        videoTrackRef = null
-        videoSinkRef  = null
+        eglVideoSinkRef?.let { videoTrackRef?.removeSink(it) }
+        videoTrackRef   = null
+        videoSinkRef    = null
+        eglVideoSinkRef = null
 
         pc?.dispose()
         pc = null

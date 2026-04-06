@@ -10,7 +10,6 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import org.webrtc.EglBase
-import org.webrtc.PeerConnectionFactory
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
 
@@ -21,7 +20,8 @@ import org.webrtc.SurfaceViewRenderer
  * The server URL is persisted in SharedPreferences so it survives restarts.
  *
  * TASK-003: SignalingClient + WebRTCEngine + flat SurfaceViewRenderer.
- * TODO TASK-004: initialize OpenXR session and xr_renderer for stereo display.
+ * TASK-004: EglVideoSink + zero-copy OES texture path wired to native code.
+ * TODO TASK-005: initialize OpenXR session and xr_renderer for stereo display.
  * TODO TASK-005: wire dataChannel.onClockSynced / onTimestamp into the stats overlay.
  */
 class MainActivity : Activity() {
@@ -35,6 +35,29 @@ class MainActivity : Activity() {
         init {
             System.loadLibrary("fpv-native")
         }
+
+        // ── JNI — video_decoder.cpp ────────────────────────────────────────────
+
+        /** Allocate a placeholder GL_TEXTURE_EXTERNAL_OES texture; returns its GL name. */
+        @JvmStatic external fun nativeCreateVideoTexture(): Int
+
+        /**
+         * Store the latest WebRTC OES texture ID and SurfaceTexture transform matrix.
+         * Called by EglVideoSink on every hardware-decoded frame.
+         */
+        @JvmStatic external fun nativeUpdateVideoFrame(textureId: Int, transformMatrix: FloatArray)
+
+        /** Return the most recently stored OES texture ID (0 if no frame yet). */
+        @JvmStatic external fun nativeGetVideoTextureId(): Int
+
+        /** Copy the most recently stored 3×3 transform matrix (float[9], row-major). */
+        @JvmStatic external fun nativeGetVideoTransformMatrix(outMatrix: FloatArray)
+
+        // ── JNI — xr_renderer.cpp (TASK-005) ──────────────────────────────────
+
+        @JvmStatic external fun nativeInitXR()
+        @JvmStatic external fun nativeRenderFrame()
+        @JvmStatic external fun nativeDestroyXR()
     }
 
     // EGL context shared between HardwareVideoDecoderFactory and SurfaceViewRenderer
@@ -50,6 +73,7 @@ class MainActivity : Activity() {
     // WebRTC stack
     private var engine: WebRTCEngine? = null
     private var signaling: SignalingClient? = null
+    private var eglVideoSink: EglVideoSink? = null
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -129,15 +153,17 @@ class MainActivity : Activity() {
         // Tear down any previous session before creating a new one
         teardown()
 
-        // Init the WebRTC stack
+        // Init the WebRTC stack.
+        // PeerConnectionFactory.initialize() (with field trials) is called once
+        // inside WebRTCEngine.init() — do NOT call it again here without field trials.
         engine = WebRTCEngine()
-
-        // PeerConnectionFactory.initialize() is idempotent
-        PeerConnectionFactory.initialize(
-            PeerConnectionFactory.InitializationOptions.builder(this)
-                .createInitializationOptions()
-        )
         engine!!.init(this, eglBase)
+
+        // Zero-copy OES sink (TASK-004): receives TextureBuffer frames from the
+        // hardware decoder and forwards texture ID + transform matrix to native code.
+        eglVideoSink = EglVideoSink { texId, matrix ->
+            nativeUpdateVideoFrame(texId, matrix)
+        }
 
         // TODO TASK-005: wire clock sync and E2E timestamps into a stats overlay
         // engine!!.dataChannel.onClockSynced = { offsetMs -> ... }
@@ -160,9 +186,10 @@ class MainActivity : Activity() {
         )
 
         engine!!.start(
-            signaling  = signaling!!,
-            videoSink  = renderer,
-            onStatus   = { state -> runOnUiThread { setStatus(state) } }
+            signaling    = signaling!!,
+            videoSink    = renderer,
+            eglVideoSink = eglVideoSink,
+            onStatus     = { state -> runOnUiThread { setStatus(state) } }
         )
 
         signaling!!.connect(url)
@@ -174,6 +201,7 @@ class MainActivity : Activity() {
         signaling = null
         engine?.close()
         engine = null
+        eglVideoSink = null
     }
 
     private fun setStatus(msg: String) {

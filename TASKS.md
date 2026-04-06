@@ -501,7 +501,7 @@ WebRTCEngine (io.github.webrtc-sdk:android)
 
 ## TASK-004 — Zero-copy видео-пайплайн: MediaCodec → SurfaceTexture → OpenGL ES
 
-**Статус:** `todo`  
+**Статус:** `done`  
 **Приоритет:** критический (даёт −33 мс на декодинге)  
 **Зависимости:** TASK-003
 
@@ -581,10 +581,10 @@ PeerConnectionFactory.initialize(
 
 ### Критерии готовности
 
-- [ ] `adb logcat | grep MediaCodec` подтверждает surface output mode
-- [ ] E2E задержка декодинга (из DataChannel stats) < 8 мс
-- [ ] Нет CPU spikes при рендеринге (профайлер Android Studio → CPU)
-- [ ] Jitter buffer < 10 мс в среднем (из DataChannel clock sync)
+- [x] `adb logcat | grep MediaCodec` подтверждает surface output mode
+- [x] E2E задержка декодинга (из DataChannel stats) < 8 мс
+- [x] Нет CPU spikes при рендеринге (профайлер Android Studio → CPU)
+- [x] Jitter buffer < 10 мс в среднем (из DataChannel clock sync)
 
 ---
 
