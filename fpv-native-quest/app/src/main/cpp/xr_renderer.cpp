@@ -50,6 +50,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <time.h>      // nanosleep / struct timespec
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -176,8 +177,8 @@ struct Mat4 {
 
 static const char* VERT_SRC = R"glsl(
 #version 300 es
-in vec2 a_pos;
-in vec2 a_uv;
+layout(location = 0) in vec2 a_pos;
+layout(location = 1) in vec2 a_uv;
 uniform mat4 u_viewProj;
 uniform float u_halfW;
 uniform float u_halfH;
@@ -498,13 +499,34 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
         EGLDisplay display = eglGetCurrentDisplay();
         EGLContext context = eglGetCurrentContext();
 
-        // Recover EGLConfig from current context
+        if (display == EGL_NO_DISPLAY || context == EGL_NO_CONTEXT) {
+            LOGE("No current EGL context — XrRenderThread must call makeCurrent() first");
+            return false;
+        }
+
+        // Recover EGLConfig from the current context by enumerating all configs and
+        // matching EGL_CONFIG_ID.  eglChooseConfig({EGL_CONFIG_ID, id}) is unreliable
+        // on Adreno (Quest 2) — it often returns 0 results, leaving config=nullptr,
+        // which causes xrCreateSession to fail with XR_ERROR_GRAPHICS_DEVICE_INVALID.
         EGLint configId = 0;
         eglQueryContext(display, context, EGL_CONFIG_ID, &configId);
+        LOGI("EGL: display=%p context=%p configId=%d", (void*)display, (void*)context, configId);
+
+        EGLint nTotal = 0;
+        eglGetConfigs(display, nullptr, 0, &nTotal);
+        std::vector<EGLConfig> allCfgs((size_t)nTotal);
+        eglGetConfigs(display, allCfgs.data(), nTotal, &nTotal);
+
         EGLConfig config = nullptr;
-        EGLint nCfg = 0;
-        EGLint cfgAttribs[] = {EGL_CONFIG_ID, configId, EGL_NONE};
-        eglChooseConfig(display, cfgAttribs, &config, 1, &nCfg);
+        for (EGLint i = 0; i < nTotal && !config; ++i) {
+            EGLint id = 0;
+            eglGetConfigAttrib(display, allCfgs[i], EGL_CONFIG_ID, &id);
+            if (id == configId) config = allCfgs[i];
+        }
+        if (!config) {
+            LOGE("EGLConfig not found for configId=%d (nTotal=%d)", configId, nTotal);
+            return false;
+        }
 
         XrGraphicsBindingOpenGLESAndroidKHR gfxBinding = {
             XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR};
@@ -516,7 +538,7 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
         sci.next     = &gfxBinding;
         sci.systemId = g_xr.systemId;
         XR_CHECK(xrCreateSession(g_xr.instance, &sci, &g_xr.session));
-        LOGI("XrSession created (EGL context=%p)", (void*)context);
+        LOGI("XrSession created (EGL context=%p configId=%d)", (void*)context, configId);
     }
 
     // ── 7. Create reference space ─────────────────────────────────────────────
@@ -541,14 +563,12 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
     }
 
     // ── 9. Compile shaders and build quad geometry ────────────────────────────
+    // Attribute locations are declared in the vertex shader via layout(location=N),
+    // so no glBindAttribLocation is needed — a single linkProgram() call is correct.
     g_xr.videoProgram = linkProgram(VERT_SRC, FRAG_SRC);
     if (!g_xr.videoProgram) return false;
 
-    // Bind attribute locations
-    glBindAttribLocation(g_xr.videoProgram, 0, "a_pos");
-    glBindAttribLocation(g_xr.videoProgram, 1, "a_uv");
-
-    // Cache uniform locations
+    // Cache uniform locations (must be done after linking)
     g_xr.u_viewProj = glGetUniformLocation(g_xr.videoProgram, "u_viewProj");
     g_xr.u_halfW    = glGetUniformLocation(g_xr.videoProgram, "u_halfW");
     g_xr.u_halfH    = glGetUniformLocation(g_xr.videoProgram, "u_halfH");
@@ -556,12 +576,12 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
     g_xr.u_yOff     = glGetUniformLocation(g_xr.videoProgram, "u_yOff");
     g_xr.u_video    = glGetUniformLocation(g_xr.videoProgram, "u_video");
     g_xr.u_stMat    = glGetUniformLocation(g_xr.videoProgram, "u_stMat");
+    LOGI("Uniforms: viewProj=%d halfW=%d halfH=%d dist=%d yOff=%d video=%d stMat=%d",
+         g_xr.u_viewProj, g_xr.u_halfW, g_xr.u_halfH, g_xr.u_dist,
+         g_xr.u_yOff, g_xr.u_video, g_xr.u_stMat);
 
     if (!createQuadGeometry(g_xr.quadVAO, g_xr.quadVBO, g_xr.quadEBO))
         return false;
-
-    // Need to re-link after BindAttribLocation
-    glLinkProgram(g_xr.videoProgram);
 
     LOGI("xr_renderer: init complete — session created, shaders compiled");
     return true;

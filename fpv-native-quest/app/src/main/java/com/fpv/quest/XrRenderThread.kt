@@ -1,6 +1,7 @@
 package com.fpv.quest
 
 import android.app.Activity
+import android.opengl.EGL14
 import android.util.Log
 import org.webrtc.EglBase
 
@@ -38,12 +39,23 @@ class XrRenderThread(
         Log.i(TAG, "started")
 
         // ── 1. Create shared EGL context ──────────────────────────────────────
-        // Sharing with webRtcEglContext puts both contexts in the same EGL share
-        // group → OES textures allocated by WebRTC's SurfaceTextureHelper are
-        // accessible here (Adreno/Quest 2 supports cross-context OES sampling
-        // within the same share group).
+        // Must use an explicit RGBA8 + ES3 config — EglBase.create(context) without
+        // config attributes defaults to CONFIG_PLAIN_PIXEL_BUFFER = {EGL_NONE}, which
+        // lets EGL pick any config. On Quest 2 (Adreno 650), that often results in a
+        // pixel-buffer-only config that OpenXR rejects with XR_ERROR_GRAPHICS_DEVICE_INVALID.
+        //
+        // 0x40 = EGL_OPENGL_ES3_BIT (= EGL_OPENGL_ES3_BIT_KHR); not a named constant
+        // in android.opengl.EGL14, so use the raw value.
+        val xrEglConfig = intArrayOf(
+            EGL14.EGL_RED_SIZE,   8,
+            EGL14.EGL_GREEN_SIZE, 8,
+            EGL14.EGL_BLUE_SIZE,  8,
+            EGL14.EGL_ALPHA_SIZE, 8,
+            EGL14.EGL_RENDERABLE_TYPE, 0x40,  // EGL_OPENGL_ES3_BIT
+            EGL14.EGL_NONE
+        )
         val egl = try {
-            EglBase.create(webRtcEglContext).also { sharedEgl = it }
+            EglBase.create(webRtcEglContext, xrEglConfig).also { sharedEgl = it }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create shared EGL context: $e")
             return
