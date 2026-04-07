@@ -141,32 +141,55 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         Log.d(TAG, "onResume")
+        // With com.oculus.intent.category.VR, Quest expects the XR session to start
+        // immediately — otherwise it shows its loading spinner indefinitely.
+        startXrThread()
 
-        // Start the OpenXR render thread (if not already running).
-        // The XR session lifecycle (IDLE→READY→FOCUSED) is driven by the runtime;
-        // the thread starts polling events immediately and begins rendering when
-        // the headset is worn and the app is focused.
-        if (xrThread == null) {
-            xrThread = XrRenderThread(this, eglBase.eglBaseContext).also { it.start() }
-            Log.i(TAG, "XrRenderThread started")
+        // Once the XR session is FOCUSED the 2D overlay is hidden by the VR compositor,
+        // so auto-connect to the last-saved URL on launch.  The overlay stays as a
+        // fallback (visible as a VR panel before FOCUSED, or after a failed connection).
+        if (engine == null) {
+            val url = urlInput.text.toString().trim()
+            if ((url.startsWith("ws://") || url.startsWith("wss://")) && !url.contains("x.x")) {
+                overlay.visibility = View.GONE
+                Log.i(TAG, "Auto-connecting to saved URL: $url")
+                startConnection()
+            }
         }
     }
 
     override fun onPause() {
         super.onPause()
         Log.d(TAG, "onPause")
-        stopXrThread()
+        // Do NOT stop XrRenderThread here. With com.oculus.intent.category.VR,
+        // onPause fires when the Quest system menu opens — the XR session is still
+        // running (VISIBLE state). The XR state machine handles this naturally.
+    }
+
+    override fun onStop() {
+        super.onStop()
+        Log.d(TAG, "onStop")
+        // Do NOT stop XrRenderThread here. The XR session continues in the
+        // background; the runtime sends XR_SESSION_STATE_STOPPING when it wants
+        // us to stop, causing nativeRenderFrame() to return false on its own.
     }
 
     override fun onDestroy() {
         super.onDestroy()
         Log.d(TAG, "onDestroy")
+        stopXrThread()
         teardown()
         renderer.release()   // must precede eglBase.release()
         eglBase.release()
     }
 
     // ── OpenXR render thread management ─────────────────────────────────────
+
+    private fun startXrThread() {
+        if (xrThread != null) return
+        xrThread = XrRenderThread(this, eglBase.eglBaseContext).also { it.start() }
+        Log.i(TAG, "XrRenderThread started")
+    }
 
     private fun stopXrThread() {
         xrThread?.let { t ->
@@ -229,7 +252,7 @@ class MainActivity : Activity() {
             onDisconnected = {
                 runOnUiThread {
                     setStatus("Disconnected — check server and reconnect")
-                    overlay.visibility = View.VISIBLE
+                    // overlay shown via onStatus("disconnected") above
                 }
             }
         )
@@ -238,7 +261,23 @@ class MainActivity : Activity() {
             signaling    = signaling!!,
             videoSink    = renderer,
             eglVideoSink = eglVideoSink,
-            onStatus     = { state -> runOnUiThread { setStatus(state) } }
+            onStatus     = { state ->
+                runOnUiThread {
+                    setStatus(state)
+                    when (state) {
+                        "connected" -> {
+                            // Video will appear automatically in XR swapchain once
+                            // nativeUpdateVideoFrame receives frames from EglVideoSink.
+                        }
+                        "disconnected" -> {
+                            // Transient ICE state — do NOT kill the XR session.
+                        }
+                        "failed", "closed" -> {
+                            overlay.visibility = View.VISIBLE
+                        }
+                    }
+                }
+            }
         )
 
         signaling!!.connect(url)

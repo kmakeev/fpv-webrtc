@@ -143,8 +143,11 @@ cp local.properties.template local.properties
 # Установить JAVA_HOME если JDK 17 не в PATH (macOS Homebrew)
 export JAVA_HOME=/opt/homebrew/opt/openjdk@17
 
+# ОБЯЗАТЕЛЬНО: потянуть Meta OpenXR loader с подключённого Quest 2
+# (Khronos loader из Maven не обнаруживает Meta runtime — XR_ERROR_RUNTIME_UNAVAILABLE)
+adb pull /system/lib64/libopenxr_loader.so app/src/main/jniLibs/arm64-v8a/libopenxr_loader.so
+
 # Сборка debug APK
-# Gradle автоматически скачивает OpenXR loader с Maven Central при первой сборке
 ./gradlew assembleDebug
 # APK: app/build/outputs/apk/debug/app-debug.apk
 
@@ -168,7 +171,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | `io.github.webrtc-sdk:android` | 125.6422.07 | Google pre-built libwebrtc: PeerConnectionFactory, HardwareVideoDecoderFactory, DataChannel |
 | `com.squareup.okhttp3:okhttp` | 4.12.0 | WebSocket для сигналинга |
 | `kotlinx-coroutines-android` | 1.8.0 | Async clock sync, WebSocket callbacks |
-| `org.khronos.openxr:openxr_loader_for_android` | 1.1.49 | Khronos OpenXR loader (libopenxr_loader.so + хедеры) — Maven Central, Prefab AAR; CMake таргет `OpenXR::openxr_loader` |
+| `org.khronos.openxr:openxr_loader_for_android` | 1.1.49 | **Только хедеры** (`compileOnly`); Prefab AAR; CMake таргет `OpenXR::headers`. Сам .so — Meta loader из `jniLibs/` (см. ADB pull выше) |
 
 ### Соответствие JS ↔ Kotlin/C++ модулей
 
@@ -193,8 +196,9 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - Стример (`streamer.html`) отправляет `type:'ts'` с `capture = encode = Date.now()` — энкод-задержка вебкамеры в браузере недоступна; для ESP32-P4 это поле будет содержать реальное время H.264-кодирования.
 - Метка времени захвата (`capture`) — `Date.now()` в момент отправки `ts`-сообщения, не RTP-timestamp.
 - `totalDecodeTime` на Android/Quest включает async MediaCodec pipeline latency (~38ms), а не только декодирование (~2ms). `requestVideoFrameCallback.processingDuration` возвращает ту же величину — rVFC отклонён (добавляет нагрузку без улучшения точности).
-- OpenXR loader (`libopenxr_loader.so`) поставляется через Meta Maven Prefab AAR (`com.meta.xr.sdk.openxr:openxr-android-loader:74.0.0`). Gradle скачивает его автоматически, CMake получает через `find_package(openxr)`. Для IDE-автодополнения хедеров запусти `./fpv-native-quest/setup-openxr.sh`.
+- OpenXR loader (`libopenxr_loader.so`) должен быть потянут с устройства: `adb pull /system/lib64/libopenxr_loader.so app/src/main/jniLibs/arm64-v8a/`. Khronos loader из Maven Central не обнаруживает Meta runtime на Quest 2 (`XR_ERROR_RUNTIME_UNAVAILABLE -51`). Хедеры берутся из Khronos Prefab AAR (`org.khronos.openxr:openxr_loader_for_android:1.1.49`, `compileOnly`); CMake таргет `OpenXR::headers`.
 - OES-текстура из WebRTC (`g_videoTexId`) доступна в XR render thread через shared EGL context (`EglBase.create(eglBase.eglBaseContext)`). `video_decoder.cpp` вызывает `glFlush()` после каждого обновления текстуры для cross-context видимости на Adreno (Quest 2).
-- `XrRenderThread` стартует в `onResume()` и останавливается в `onPause()`. `nativeRenderFrame()` блокируется внутри `xrWaitFrame()` (~13.9 мс при 72 Гц) — дополнительный sleep не нужен. Для graceful exit вызывается `xrRequestExitSession()`.
-- Манифест должен содержать `<category android:name="com.oculus.intent.category.VR" />` и `<meta-data android:name="com.oculus.vr.focusaware" android:value="true" />` — без этого приложение работает в 2D-панели VR shell, а не в иммерсивном XR-режиме.
+- `XrRenderThread` стартует в `onResume()` (немедленно, до подключения WebRTC) и останавливается в `onDestroy()`. НЕ останавливается в `onPause()`/`onStop()` — XR runtime управляет состоянием сессии через `XR_SESSION_STATE_*` события сам. `nativeRenderFrame()` блокируется внутри `xrWaitFrame()` (~13.9 мс при 72 Гц). При отсутствии видео рендерит чёрный кадр (g_videoTexId=0), видео появляется автоматически при получении фреймов через EglVideoSink.
+- `com.oculus.intent.category.VR` обязателен в манифесте. Без него Quest уничтожает Activity (`onPause→onStop→onDestroy`) при переходе в VR-режим, посылая `XR_SESSION_STATE_STOPPING` сразу после `onPause`. С этой категорией Activity остаётся жива. Приложение авто-подключается к сохранённому URL при старте (`onResume`); первичная настройка URL — через оверлей (виден до захвата XR-фокуса) или ADB.
+- `<meta-data android:name="com.oculus.vr.focusaware" android:value="true" />` обязателен — без него сессия не достигает `XR_SESSION_STATE_FOCUSED` и контроллерный ввод не доставляется.
 - Шейдер использует `samplerExternalOES` + `GL_OES_EGL_image_external_essl3`. ST-матрица (3×3, row-major из Android) передаётся в GLSL с `glUniformMatrix3fv(..., GL_TRUE, ...)` (transpose=true). IPD и FOV берутся из `XrView` (реальные значения шлема), расстояние 1.5 м и ширина экрана 2.0 м совпадают с `webxr-renderer.js`.

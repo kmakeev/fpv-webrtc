@@ -57,9 +57,17 @@
                 <action android:name="android.intent.action.MAIN" />
                 <!-- Standard Android launcher -->
                 <category android:name="android.intent.category.LAUNCHER" />
-                <!-- Quest / Horizon OS VR launcher -->
+                <!-- Quest / Horizon OS launcher -->
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
-                <!-- Meta VR category — activates immersive VR mode (OpenXR) -->
+                <!--
+                    com.oculus.intent.category.VR is required for the Activity to survive
+                    the 2D→VR lifecycle transition.  Without it, Quest terminates the
+                    Activity (onPause → onStop → onDestroy) as soon as the 2D panel is
+                    hidden when the OpenXR session reaches FOCUSED state.
+                    With it, Quest keeps the Activity alive in VR mode. The 2D Android
+                    views (URL input, buttons) appear as a floating panel in VR space;
+                    the user interacts via Quest controllers and the virtual keyboard.
+                -->
                 <category android:name="com.oculus.intent.category.VR" />
             </intent-filter>
 

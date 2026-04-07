@@ -13,3 +13,6 @@ fpv-native-quest/captures/
 fpv-native-quest/.externalNativeBuild/
 fpv-native-quest/app/.externalNativeBuild/
 fpv-native-quest/app/.cxx/
+# OpenXR loader .so pulled from Quest 2 device (not redistributable)
+# Pull with: adb pull /system/lib64/libopenxr_loader.so app/src/main/jniLibs/arm64-v8a/
+fpv-native-quest/app/src/main/jniLibs/

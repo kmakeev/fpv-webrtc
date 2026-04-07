@@ -12,11 +12,32 @@ find_library(gles-lib     GLESv3)    # OpenGL ES 3.2
 find_library(android-lib  android)   # ANativeWindow, AAssetManager
 find_library(mediandk-lib mediandk)  # AMediaCodec, AMediaFormat (API 29+)
 
-# OpenXR loader — provided by Khronos Maven Central Prefab AAR
-# (org.khronos.openxr:openxr_loader_for_android in app/build.gradle).
-# Prefab package name: "OpenXR"; CMake target: OpenXR::openxr_loader
-# Headers at: prefab/modules/headers/include/openxr/
-find_package(OpenXR REQUIRED CONFIG)
+# ── OpenXR loader (prebuilt, pulled from Quest 2 via ADB) ───────────────────
+#
+# Meta SDK Maven (sdk.developer.oculus.com) may be inaccessible from CI / dev
+# machines without a Meta developer account or corporate proxy.
+# Solution: pull the loader binary directly from the Quest 2 system partition —
+# it is the same binary that Meta's Maven AAR would provide:
+#
+#   adb pull /system/lib64/libopenxr_loader.so \
+#       app/src/main/jniLibs/arm64-v8a/libopenxr_loader.so
+#
+# The file is in .gitignore (binary, device-specific) — each developer pulls it
+# once from their own Quest 2.  See setup-openxr.sh for the full setup script.
+#
+# OpenXR HEADERS come from the Khronos Prefab AAR (Maven Central, accessible):
+#   org.khronos.openxr:openxr_loader_for_android:1.1.49
+# The AAR exposes headers via the "headers" Prefab module (no .so needed from it).
+
+find_package(OpenXR REQUIRED CONFIG)   # headers only (from Khronos Prefab AAR)
+
+# Prebuilt Meta loader .so from jniLibs/ — packaged into the APK by AGP automatically.
+# CMake also needs it at link time so the linker can resolve OpenXR symbols.
+add_library(openxr_loader_prebuilt SHARED IMPORTED)
+set_target_properties(openxr_loader_prebuilt PROPERTIES
+    IMPORTED_LOCATION
+    "${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libopenxr_loader.so"
+)
 
 # Native shared library (loaded by MainActivity via System.loadLibrary("fpv-native"))
 add_library(fpv-native SHARED
@@ -39,5 +60,6 @@ target_link_libraries(fpv-native
     ${gles-lib}
     ${android-lib}
     ${mediandk-lib}
-    OpenXR::openxr_loader   # Khronos OpenXR loader (from Prefab AAR, Maven Central)
+    OpenXR::headers          # Khronos headers-only Prefab target
+    openxr_loader_prebuilt   # Meta loader .so from jniLibs/
 )
