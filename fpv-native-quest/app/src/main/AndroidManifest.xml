@@ -1,6 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!--
+        Android 11+ (API 30) package visibility: without <queries>, PackageManager
+        hides other apps' services from us.  The Khronos OpenXR loader discovers the
+        Meta Quest runtime by querying for services with these action names.
+        Without these entries the loader returns XR_ERROR_RUNTIME_UNAVAILABLE (-51)
+        because it cannot see the Meta OpenXR runtime service on Quest 2/3.
+    -->
+    <queries>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+        </intent>
+    </queries>
+
     <!-- Network access for WebSocket signaling and WebRTC ICE -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />

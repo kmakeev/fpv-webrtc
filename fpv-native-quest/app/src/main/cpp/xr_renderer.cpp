@@ -63,15 +63,24 @@
 
 static const char* xrResultStr(XrResult r) {
     switch (r) {
-        case XR_SUCCESS:                         return "XR_SUCCESS";
-        case XR_ERROR_INITIALIZATION_FAILED:     return "XR_ERROR_INITIALIZATION_FAILED";
-        case XR_ERROR_RUNTIME_FAILURE:           return "XR_ERROR_RUNTIME_FAILURE";
-        case XR_ERROR_INSTANCE_LOST:             return "XR_ERROR_INSTANCE_LOST";
-        case XR_ERROR_SESSION_LOST:              return "XR_ERROR_SESSION_LOST";
-        case XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED: return "XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED";
+        case XR_SUCCESS:                              return "XR_SUCCESS";
+        case XR_ERROR_VALIDATION_FAILURE:             return "XR_ERROR_VALIDATION_FAILURE";
+        case XR_ERROR_RUNTIME_FAILURE:                return "XR_ERROR_RUNTIME_FAILURE";
+        case XR_ERROR_INITIALIZATION_FAILED:          return "XR_ERROR_INITIALIZATION_FAILED";
+        case XR_ERROR_FUNCTION_UNSUPPORTED:           return "XR_ERROR_FUNCTION_UNSUPPORTED";
+        case XR_ERROR_EXTENSION_NOT_PRESENT:          return "XR_ERROR_EXTENSION_NOT_PRESENT";
+        case XR_ERROR_RUNTIME_UNAVAILABLE:            return "XR_ERROR_RUNTIME_UNAVAILABLE (-51): "
+            "Khronos loader cannot find the Meta OpenXR runtime. "
+            "Check <queries> in AndroidManifest.xml for org.khronos.openxr.OpenXRRuntimeService";
+        case XR_ERROR_INSTANCE_LOST:                  return "XR_ERROR_INSTANCE_LOST";
+        case XR_ERROR_SESSION_LOST:                   return "XR_ERROR_SESSION_LOST";
+        case XR_ERROR_HANDLE_INVALID:                 return "XR_ERROR_HANDLE_INVALID";
+        case XR_ERROR_SYSTEM_INVALID:                 return "XR_ERROR_SYSTEM_INVALID";
+        case XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED:   return "XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED";
         case XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING:
             return "XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING";
-        default:                                 return "(unknown XrResult)";
+        case XR_ERROR_GRAPHICS_DEVICE_INVALID:        return "XR_ERROR_GRAPHICS_DEVICE_INVALID";
+        default:                                      return "(unknown XrResult)";
     }
 }
 
