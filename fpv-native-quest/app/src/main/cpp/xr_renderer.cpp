@@ -410,6 +410,16 @@ struct XrApp {
     XrAction    menuAction    = XR_NULL_HANDLE;  // Y button → toggle VR panel
     XrAction    confirmAction = XR_NULL_HANDLE;  // A button → confirm connection
     XrAction    stickAction   = XR_NULL_HANDLE;  // left thumbstick XY → change/navigate IP octets
+
+    // TASK-007: XR_EXT_performance_settings — CPU/GPU clock boost for low latency.
+    // Function pointer loaded from the instance after xrCreateInstance; null if extension
+    // is not supported (silently skipped — the app still works, just with default clocks).
+    PFN_xrPerfSettingsSetPerformanceLevelEXT pfnPerfSettingsSetLevel = nullptr;
+
+    // True once the session has reached XR_SESSION_STATE_FOCUSED at least once.
+    // Used by Kotlin to detect compositor-transition kills (session killed before FOCUSED)
+    // and schedule an automatic restart via AlarmManager.
+    bool sessionEverFocused = false;
 };
 
 static XrApp g_xr;
@@ -547,15 +557,33 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
         androidInfo.applicationVM       = g_xr.jvm;
         androidInfo.applicationActivity = g_xr.activity;
 
-        const char* exts[] = {
+        // TASK-007: XR_EXT_performance_settings is optional — enumerate supported extensions
+        // first and include it only if available (avoids XR_ERROR_EXTENSION_NOT_PRESENT).
+        bool hasPerfSettings = false;
+        {
+            uint32_t extCount = 0;
+            xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
+            std::vector<XrExtensionProperties> extProps(extCount, {XR_TYPE_EXTENSION_PROPERTIES});
+            xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, extProps.data());
+            for (const auto& ep : extProps) {
+                if (strcmp(ep.extensionName, XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME) == 0) {
+                    hasPerfSettings = true;
+                    break;
+                }
+            }
+            LOGI("XR_EXT_performance_settings: %s", hasPerfSettings ? "available" : "not available");
+        }
+
+        std::vector<const char*> exts = {
             XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
             XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
         };
+        if (hasPerfSettings) exts.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
 
         XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
         ici.next                               = &androidInfo;
-        ici.enabledExtensionCount              = 2;
-        ici.enabledExtensionNames              = exts;
+        ici.enabledExtensionCount              = (uint32_t)exts.size();
+        ici.enabledExtensionNames              = exts.data();
         ici.applicationInfo.apiVersion         = XR_API_VERSION_1_0;
         snprintf(ici.applicationInfo.applicationName,
                  XR_MAX_APPLICATION_NAME_SIZE, "FPV Quest");
@@ -564,6 +592,15 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
 
         XR_CHECK(xrCreateInstance(&ici, &g_xr.instance));
         LOGI("XrInstance created");
+
+        // TASK-007: load XR_EXT_performance_settings function pointer
+        if (hasPerfSettings) {
+            xrGetInstanceProcAddr(g_xr.instance,
+                "xrPerfSettingsSetPerformanceLevelEXT",
+                (PFN_xrVoidFunction*)&g_xr.pfnPerfSettingsSetLevel);
+            LOGI("xrPerfSettingsSetPerformanceLevelEXT loaded: %s",
+                 g_xr.pfnPerfSettingsSetLevel ? "ok" : "failed");
+        }
     }
 
     // ── 3. Get system ─────────────────────────────────────────────────────────
@@ -652,6 +689,27 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
         sci.systemId = g_xr.systemId;
         XR_CHECK(xrCreateSession(g_xr.instance, &sci, &g_xr.session));
         LOGI("XrSession created (EGL context=%p configId=%d)", (void*)context, configId);
+    }
+
+    // ── 6b. TASK-007: Set CPU/GPU to BOOST level for minimum latency ─────────────
+    // XR_PERF_SETTINGS_LEVEL_BOOST_EXT (75) requests maximum clock speed.
+    // The Quest runtime may honour this asynchronously and will notify via
+    // XR_TYPE_EVENT_DATA_PERF_SETTINGS_EV_EXT events (we log but don't act on them).
+    // Both domains are set: CPU for WebRTC/SCTP processing, GPU for render pipeline.
+    if (g_xr.pfnPerfSettingsSetLevel) {
+        XrResult cpuResult = g_xr.pfnPerfSettingsSetLevel(
+            g_xr.session,
+            XR_PERF_SETTINGS_DOMAIN_CPU_EXT,
+            XR_PERF_SETTINGS_LEVEL_BOOST_EXT);
+        XrResult gpuResult = g_xr.pfnPerfSettingsSetLevel(
+            g_xr.session,
+            XR_PERF_SETTINGS_DOMAIN_GPU_EXT,
+            XR_PERF_SETTINGS_LEVEL_BOOST_EXT);
+        LOGI("Performance lock: CPU=%s GPU=%s",
+             XR_SUCCEEDED(cpuResult) ? "BOOST" : "failed",
+             XR_SUCCEEDED(gpuResult) ? "BOOST" : "failed");
+    } else {
+        LOGI("Performance lock: XR_EXT_performance_settings not available — default clocks");
     }
 
     // ── 7. Create reference space ─────────────────────────────────────────────
@@ -821,7 +879,9 @@ static bool xrApp_pollEvents() {
                 g_xr.sessionState = e->state;
                 LOGI("Session state → %d", (int)g_xr.sessionState);
 
-                if (g_xr.sessionState == XR_SESSION_STATE_READY) {
+                if (g_xr.sessionState == XR_SESSION_STATE_FOCUSED) {
+                    g_xr.sessionEverFocused = true;
+                } else if (g_xr.sessionState == XR_SESSION_STATE_READY) {
                     XrSessionBeginInfo sbi = {XR_TYPE_SESSION_BEGIN_INFO};
                     sbi.primaryViewConfigurationType =
                         XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -852,6 +912,14 @@ static bool xrApp_pollEvents() {
                 LOGW("Instance loss pending");
                 g_xr.exitRequested = true;
                 break;
+            case XR_TYPE_EVENT_DATA_PERF_SETTINGS_EXT: {
+                // TASK-007: runtime notifies when it has adjusted the actual performance level
+                // (e.g. thermal throttling).  Log for diagnostics; no corrective action taken.
+                auto* e = reinterpret_cast<XrEventDataPerfSettingsEXT*>(&event);
+                LOGI("PerfSettings event: domain=%d fromLevel=%d toLevel=%d subDomain=%d",
+                     (int)e->domain, (int)e->fromLevel, (int)e->toLevel, (int)e->subDomain);
+                break;
+            }
             default:
                 break;
         }
@@ -1138,9 +1206,10 @@ static void xrApp_destroy(JNIEnv* env) {
 
     if (g_xr.activity && env) { env->DeleteGlobalRef(g_xr.activity); g_xr.activity = nullptr; }
 
-    g_xr.sessionRunning = false;
-    g_xr.exitRequested  = false;
-    g_xr.sessionState   = XR_SESSION_STATE_UNKNOWN;
+    g_xr.sessionRunning     = false;
+    g_xr.exitRequested      = false;
+    g_xr.sessionState       = XR_SESSION_STATE_UNKNOWN;
+    g_xr.sessionEverFocused = false;   // reset so next session can detect first-focus correctly
 
     LOGI("xr_renderer: destroyed");
 }
@@ -1195,6 +1264,18 @@ JNIEXPORT void JNICALL
 Java_com_fpv_quest_MainActivity_nativeDestroyXR(JNIEnv* env, jclass /*clazz*/) {
     LOGI("nativeDestroyXR()");
     xrApp_destroy(env);
+}
+
+/**
+ * Returns true if the XR session has reached XR_SESSION_STATE_FOCUSED at least once
+ * since the last nativeInitXR() call.
+ *
+ * Used by MainActivity.onPause() to distinguish compositor-transition kills
+ * (session never focused → auto-restart) from deliberate user exits.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_fpv_quest_MainActivity_nativeWasSessionFocused(JNIEnv* /*env*/, jclass /*clazz*/) {
+    return g_xr.sessionEverFocused ? JNI_TRUE : JNI_FALSE;
 }
 
 /**

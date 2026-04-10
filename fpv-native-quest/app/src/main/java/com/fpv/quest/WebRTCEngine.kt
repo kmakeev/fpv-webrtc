@@ -63,8 +63,18 @@ class WebRTCEngine {
         if (factory == null) {
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(context)
-                    // Minimise jitter-buffer playout delay — reduces buffering latency.
-                    .setFieldTrials("WebRTC-MinPlayoutDelay/Enabled/")
+                    // TASK-007 QoS field trials:
+                    //   SendSideBwe-WithOverhead — include RTP/IP headers in bandwidth estimate
+                    //     so the BWE doesn't under-estimate available bandwidth on high-FPS streams.
+                    //   Video-MinPlayoutDelay — set jitter-buffer minimum playout delay to 0 ms
+                    //     (default is 0 but this trial disables the adaptive lower-bound floor).
+                    //   ReducedRtcpPollingInterval — reduce RTCP SR/RR polling from 5 s to 1 s
+                    //     so RTT estimates used by the jitter buffer update more frequently.
+                    .setFieldTrials(
+                        "WebRTC-SendSideBwe-WithOverhead/Enabled/" +
+                        "WebRTC-Video-MinPlayoutDelay/min_ms:0/" +
+                        "WebRTC-ReducedRtcpPollingInterval/Enabled/"
+                    )
                     .createInitializationOptions()
             )
             // HardwareVideoDecoderFactory uses MediaCodec + the shared EGL context so the
@@ -77,7 +87,7 @@ class WebRTCEngine {
                 // No encoder factory — this is a receive-only viewer.
                 .createPeerConnectionFactory()
 
-            Log.i(TAG, "PeerConnectionFactory initialized (HardwareVideoDecoder, MinPlayoutDelay)")
+            Log.i(TAG, "PeerConnectionFactory initialized (HardwareVideoDecoder, QoS field trials)")
         } else {
             Log.i(TAG, "PeerConnectionFactory reused (already initialized)")
         }

@@ -20,6 +20,11 @@
     <!-- Network access for WebSocket signaling and WebRTC ICE -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- TASK-007: WiFi High Performance Lock — disables power-save mode during streaming.
+         WAKE_LOCK is required by WIFI_MODE_FULL_HIGH_PERF (it holds a wake lock internally).
+         CHANGE_WIFI_STATE is required to create the WifiLock. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Quest 2 VR hardware requirements -->
     <uses-feature

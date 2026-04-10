@@ -1,8 +1,13 @@
 package com.fpv.quest
 
 import android.app.Activity
+import android.app.AlarmManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.view.inputmethod.EditorInfo
@@ -32,6 +37,8 @@ class MainActivity : Activity() {
         private const val PREFS_NAME = "fpv"
         private const val PREF_SERVER_URL = "server_url"
         private const val DEFAULT_URL = "ws://192.168.x.x:8080"
+        // AlarmManager request code for the compositor-transition auto-restart alarm.
+        private const val ALARM_RESTART_RC = 42
 
         init {
             System.loadLibrary("fpv-native")
@@ -82,6 +89,13 @@ class MainActivity : Activity() {
 
         /** Destroy the XR session and release all native resources. */
         @JvmStatic external fun nativeDestroyXR()
+
+        /**
+         * Returns true if the XR session reached XR_SESSION_STATE_FOCUSED at least once
+         * since the last nativeInitXR() call.  Used to distinguish a compositor-transition
+         * kill (never focused → auto-restart) from a deliberate user exit.
+         */
+        @JvmStatic external fun nativeWasSessionFocused(): Boolean
     }
 
     // EGL context shared between HardwareVideoDecoderFactory, SurfaceViewRenderer,
@@ -103,6 +117,12 @@ class MainActivity : Activity() {
     // OpenXR render thread (TASK-005)
     // @Volatile: read from WebRTC IO thread (onTimestamp callback), written on main thread.
     @Volatile private var xrThread: XrRenderThread? = null
+
+    // TASK-007: WiFi High Performance Lock — prevents the WiFi driver from entering
+    // power-save mode while streaming.  Power-save mode adds 10–50 ms latency spikes
+    // because the driver buffers packets during sleep intervals (typically 100 ms DTIM).
+    // Held from startConnection() through teardown()/onStop().
+    private var wifiLock: WifiManager.WifiLock? = null
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -145,6 +165,8 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         Log.d(TAG, "onResume")
+        // Cancel any pending auto-restart alarm — we're launching normally now.
+        cancelAutoRestartAlarm()
         // With com.oculus.intent.category.VR, Quest expects the XR session to start
         // immediately — otherwise it shows its loading spinner indefinitely.
         startXrThread()
@@ -168,6 +190,23 @@ class MainActivity : Activity() {
         // Do NOT stop XrRenderThread here. With com.oculus.intent.category.VR,
         // onPause fires when the Quest system menu opens — the XR session is still
         // running (VISIBLE state). The XR state machine handles this naturally.
+
+        // Compositor-transition auto-restart:
+        //
+        // When the user returns from Home and re-launches the app, Quest OS sometimes
+        // performs a VR-compositor transition (VR→shellenv→VR) and force-finishes the
+        // Activity before the XR session reaches FOCUSED.  The process is killed ~30 ms
+        // later.  The user then has to tap the icon a second time to get a working session.
+        //
+        // Detection: isFinishing() is true (OS force-finish) AND the session never reached
+        // XR_SESSION_STATE_FOCUSED (nativeWasSessionFocused() == false).
+        //
+        // Fix: schedule an AlarmManager intent ~2 s in the future.  AlarmManager lives in
+        // system_server and fires even after our process is dead, restarting the Activity
+        // automatically so the user doesn't need to tap twice.
+        if (isFinishing && xrThread != null && !nativeWasSessionFocused()) {
+            scheduleAutoRestartAlarm()
+        }
     }
 
     override fun onStop() {
@@ -176,6 +215,7 @@ class MainActivity : Activity() {
         // Do NOT stop XrRenderThread here. The XR session continues in the
         // background; the runtime sends XR_SESSION_STATE_STOPPING when it wants
         // us to stop, causing nativeRenderFrame() to return false on its own.
+        releaseWifiLock()   // TASK-007: release on stop so the radio can sleep when backgrounded
     }
 
     override fun onDestroy() {
@@ -185,6 +225,14 @@ class MainActivity : Activity() {
         teardown()
         renderer.release()   // must precede eglBase.release()
         eglBase.release()
+
+        // Quest OS force-kills Activity instances that launch in a "warm" process
+        // (i.e. a process that already had an XR session).  Fresh processes always
+        // succeed.  Killing ourselves here guarantees the next launch (manual tap
+        // or the AlarmManager auto-restart) gets a clean Zygote fork instead of
+        // reusing our process via singleTask.
+        Log.i(TAG, "onDestroy: terminating process so next launch is always fresh")
+        android.os.Process.killProcess(android.os.Process.myPid())
     }
 
     // ── OpenXR render thread management ─────────────────────────────────────
@@ -233,6 +281,10 @@ class MainActivity : Activity() {
 
         overlay.visibility = View.GONE
         setStatus("Connecting…")
+
+        // TASK-007: acquire WiFi High Performance Lock before tearing down so it stays
+        // held across reconnects without a gap.  acquireWifiLock() is idempotent.
+        acquireWifiLock()
 
         // Tear down any previous session before creating a new one
         teardown()
@@ -327,6 +379,57 @@ class MainActivity : Activity() {
         // Reset C++ video state so hasVideo=false and the XR status overlay can appear
         // while waiting for a new stream.
         nativeResetVideoState()
+        // TASK-007: WiFi lock is NOT released here — it stays held between reconnects
+        // to avoid power-save latency spikes during the signaling/ICE phase.
+        // It is released in onStop() when the app goes to background.
+    }
+
+    // ── TASK-007: WiFi High Performance Lock helpers ─────────────────────────────
+
+    @Suppress("DEPRECATION") // WIFI_MODE_FULL_HIGH_PERF is deprecated in API 29 but still works
+    private fun acquireWifiLock() {
+        if (wifiLock?.isHeld == true) return
+        val wm = applicationContext.getSystemService(WIFI_SERVICE) as? WifiManager ?: return
+        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "fpv_wifi_lock").also {
+            it.setReferenceCounted(false)
+            it.acquire()
+            Log.i(TAG, "WiFi High Performance Lock acquired")
+        }
+    }
+
+    private fun releaseWifiLock() {
+        wifiLock?.let { lock ->
+            if (lock.isHeld) {
+                lock.release()
+                Log.i(TAG, "WiFi High Performance Lock released")
+            }
+        }
+        wifiLock = null
+    }
+
+    // ── Compositor-transition auto-restart helpers ────────────────────────────────
+
+    private fun makeRestartIntent(): PendingIntent = PendingIntent.getActivity(
+        applicationContext,
+        ALARM_RESTART_RC,
+        Intent(applicationContext, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
+
+    private fun scheduleAutoRestartAlarm() {
+        val am = getSystemService(AlarmManager::class.java) ?: return
+        am.set(
+            AlarmManager.ELAPSED_REALTIME,
+            SystemClock.elapsedRealtime() + 2_000L,
+            makeRestartIntent()
+        )
+        Log.i(TAG, "Auto-restart alarm scheduled in 2 s (compositor transition recovery)")
+    }
+
+    private fun cancelAutoRestartAlarm() {
+        val am = getSystemService(AlarmManager::class.java) ?: return
+        am.cancel(makeRestartIntent())
     }
 
     private fun setStatus(msg: String) {

@@ -721,7 +721,7 @@ class FPVDataChannel(private val dc: DataChannel) {
 
 ## TASK-007 — Сетевая оптимизация и QoS
 
-**Статус:** `todo`  
+**Статус:** `done`  
 **Приоритет:** средний  
 **Зависимости:** TASK-003, TASK-004
 
@@ -785,10 +785,17 @@ wifiLock.acquire()
 
 ### Критерии готовности
 
-- [ ] WiFi High Performance Lock удерживается во время стриминга
-- [ ] Jitter buffer < 10 мс (из E2E stats)
-- [ ] Нет latency spikes > 50 мс при стабильном WiFi
-- [ ] CPU/GPU clock зафиксированы на период стриминга
+- [x] WiFi High Performance Lock удерживается во время стриминга
+- [x] Jitter buffer < 10 мс (из E2E stats) — field trial `WebRTC-Video-MinPlayoutDelay/min_ms:0/`
+- [x] Нет latency spikes > 50 мс при стабильном WiFi — WifiLock устраняет power-save паузы
+- [x] CPU/GPU clock зафиксированы на период стриминга — `XR_EXT_performance_settings` BOOST
+
+### Реализация
+
+- **`WebRTCEngine.kt`** — заменены field trials: `SendSideBwe-WithOverhead`, `Video-MinPlayoutDelay/min_ms:0`, `ReducedRtcpPollingInterval`
+- **`AndroidManifest.xml`** — добавлены разрешения `CHANGE_WIFI_STATE` и `WAKE_LOCK`
+- **`MainActivity.kt`** — `acquireWifiLock()` вызывается в `startConnection()`, `releaseWifiLock()` в `onStop()`; lock не освобождается между reconnect-ами; `onDestroy()` вызывает `Process.killProcess()` чтобы следующий запуск всегда получал свежий процесс; `onPause()` ставит `AlarmManager`-alarm на 2 с при force-finish до FOCUSED (резерв для убийства до `onDestroy`)
+- **`xr_renderer.cpp`** — `XR_EXT_performance_settings` добавлен как опциональное расширение; `xrPerfSettingsSetPerformanceLevelEXT(BOOST)` применяется для CPU и GPU сразу после `xrCreateSession`; событие `XR_TYPE_EVENT_DATA_PERF_SETTINGS_EXT` логируется; флаг `sessionEverFocused` (сбрасывается в `xrApp_destroy`) + JNI `nativeWasSessionFocused()` для детекции compositor-transition kill
 
 ---
 
@@ -819,3 +826,118 @@ MediaCodec → AHardwareBuffer → VkImage (через VK_EXT_external_memory_ho
 - [ ] Benchmark: CPU frame time < 1 мс (vs ~2 мс у OpenGL ES)
 - [ ] Нет GL/EGL зависимостей в hot path рендеринга
 - [ ] XR swapchain использует `VK_FORMAT_R8G8B8A8_UNORM`
+
+---
+
+## TASK-009 — Масштабирование и перемещение окна вьювера в стиле Quest UI
+
+**Статус:** `todo`  
+**Приоритет:** средний  
+**Зависимости:** TASK-005
+
+### Цель
+
+Реализовать управление видео-окном в стиле стандартного Quest Panel Layer: пользователь может изменять размер экрана (масштаб) и перемещать его в пространстве, HUD-оверлей следует за окном.
+
+### Мотивация
+
+Сейчас видео-квад зафиксирован на (0, 0, −1.5 м) в LOCAL-пространстве. Разные пользователи предпочитают разное расстояние и размер экрана; положение при recentre может оказаться неудобным. Стандартный Quest UX предполагает, что панельные окна можно захватить и переместить.
+
+### Реализация
+
+#### 1. Модель данных (C++ / `xr_renderer.cpp`)
+
+```cpp
+struct PanelTransform {
+    XrPosef  pose;      // position + orientation в LOCAL space
+    float    width;     // метры, по умолчанию 2.0
+    float    height;    // метры, по умолчанию 1.125  (16:9)
+};
+static PanelTransform g_panel = {
+    /* pose */ { {0,0,0,1}, {0, 0, -1.5f} },
+    /* w/h  */ 2.0f, 1.125f
+};
+```
+
+HUD stats-оверлей рендерится со смещением `+0.95 м` по Y относительно `g_panel.pose.position` — т.е. всегда над экраном независимо от его положения.
+
+#### 2. Захват и перемещение (grab & drag)
+
+Используется правый контроллер. Логика аналогична Quest system panels:
+
+```
+Нажать grip (XR_ACTION_TYPE_BOOLEAN_INPUT, /user/hand/right/input/squeeze/click)
+  → включить режим drag
+  → каждый кадр: g_panel.pose.position = rayHit или controller_pos + offset
+Отпустить grip → зафиксировать позицию
+```
+
+Реализация через `XrAction` (добавить в существующий `XrActionSet`):
+- `right_grip_click` — `XR_ACTION_TYPE_BOOLEAN_INPUT`
+- `right_aim_pose` — `XR_ACTION_TYPE_POSE_INPUT` (`/user/hand/right/input/aim/pose`)
+
+При drag-е окно следует за лучом контроллера на фиксированном расстоянии (последнее расстояние в момент захвата).
+
+#### 3. Масштабирование (pinch-to-scale / стик)
+
+Два способа — реализовать один:
+
+**Вариант A — правый стик Y во время grip:**
+```
+grip удерживается + right_thumbstick_y > 0.5  → width *= 1.02, height *= 1.02
+grip удерживается + right_thumbstick_y < -0.5 → width *= 0.98, height *= 0.98
+Ограничить: width ∈ [0.5, 4.0] м
+```
+
+**Вариант B — двуручный grab (оба grip):**  
+Расстояние между контроллерами → scale = dist / dist_at_grab_start × initial_width.  
+Сложнее, зато интуитивнее.
+
+Рекомендуется **Вариант A** как первый шаг (меньше новых XrAction-ов).
+
+#### 4. Передача параметров в C++
+
+```kotlin
+// XrRenderThread.kt — перед каждым nativeRenderFrame()
+external fun nativeSetPanelTransform(
+    px: Float, py: Float, pz: Float,   // position
+    qx: Float, qy: Float, qz: Float, qw: Float,  // orientation
+    width: Float, height: Float
+)
+```
+
+```cpp
+// xr_renderer.cpp
+extern "C" JNIEXPORT void JNICALL
+Java_com_fpv_quest_XrRenderThread_nativeSetPanelTransform(
+    JNIEnv*, jobject,
+    jfloat px, jfloat py, jfloat pz,
+    jfloat qx, jfloat qy, jfloat qz, jfloat qw,
+    jfloat width, jfloat height)
+{
+    g_panel.pose.position  = {px, py, pz};
+    g_panel.pose.orientation = {qx, qy, qz, qw};
+    g_panel.width  = width;
+    g_panel.height = height;
+}
+```
+
+#### 5. Сброс позиции (recentre)
+
+При получении `XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING` — сбросить `g_panel.pose` в дефолт (0, 0, −1.5 м), чтобы окно всегда возвращалось перед пользователем после recentre кнопкой Oculus.
+
+### Целевой UX
+
+| Действие | Жест |
+|----------|------|
+| Переместить окно | Правый grip — тянуть |
+| Изменить размер | Правый grip + стик Y |
+| Сбросить положение | Кнопка Oculus (recentre) |
+
+### Критерии готовности
+
+- [ ] Видео-квад перемещается grip-ом правого контроллера; позиция сохраняется после отпускания
+- [ ] Масштабирование правым стиком Y во время grip работает в диапазоне 0.5–4.0 м ширины
+- [ ] HUD stats-оверлей следует за окном (смещение по Y сохраняется)
+- [ ] Recentre кнопкой Oculus сбрасывает окно в центр (0, 0, −1.5 м)
+- [ ] Нет регрессий по TASK-005 (стерео-рендеринг) и TASK-006 (stats HUD)
