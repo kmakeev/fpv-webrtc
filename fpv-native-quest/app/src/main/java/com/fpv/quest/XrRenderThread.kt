@@ -63,8 +63,8 @@ class XrRenderThread(
         private const val PANEL_H = 160
     }
 
-    // Regex: ws(s)://A.B.C.D:port  or  ws://A.B.C.D  (last octet is editable)
-    private val urlRegex = Regex("""^(wss?://\d+\.\d+\.\d+\.)(\d+)(:\d+)?$""")
+    // Regex: ws(s)://A.B.C.D[:port]  — captures all 4 octets separately
+    private val urlRegex = Regex("""^(wss?://)(\d+)\.(\d+)\.(\d+)\.(\d+)(:\d+)?$""")
 
     init { parseUrl(serverUrl) }
 
@@ -92,13 +92,17 @@ class XrRenderThread(
     }
 
     // ── VR connection panel state (render-thread-only fields) ─────────────────
-    private var panelVisible      = false
-    private var baseUrl           = ""   // URL prefix  e.g. "ws://192.168.1."
-    private var lastOctet         = -1   // editable last octet (0..255), -1 = not parseable
-    private var urlSuffix         = ""   // URL suffix  e.g. ":8080"
-    private var panelTexId        = 0    // GL texture name; 0 = not yet created
-    private var lastOctetChangeMs = 0L   // for thumbstick auto-repeat debounce
-    private val inputBuf          = FloatArray(3)  // reused per-frame for nativeGetLastInputState
+    private var panelVisible       = false
+    private var urlScheme          = "ws://"   // "ws://" or "wss://"
+    private val octets             = IntArray(4)  // four IP octets, each 0..255
+    private var urlPort            = ""           // e.g. ":8080" or ""
+    private var isParseable        = false        // false if URL doesn't match expected pattern
+    private var rawUrl             = ""           // kept as-is when not parseable
+    private var currentOctetIdx    = 3            // which octet is currently selected (0..3)
+    private var panelTexId         = 0            // GL texture name; 0 = not yet created
+    private var stickXChangeMs     = 0L           // debounce timer for X-axis (change value)
+    private var stickYChangeMs     = 0L           // debounce timer for Y-axis (navigate octet)
+    private val inputBuf           = FloatArray(4) // reused per-frame for nativeGetLastInputState
 
     /**
      * Request a stats HUD update.  Safe to call from any thread.
@@ -188,7 +192,7 @@ class XrRenderThread(
                 }
                 // Process controller input after nativeRenderFrame (actions already synced in C++)
                 nativeGetLastInputState(inputBuf)
-                processInput(inputBuf[0] > 0.5f, inputBuf[1] > 0.5f, inputBuf[2])
+                processInput(inputBuf[0] > 0.5f, inputBuf[1] > 0.5f, inputBuf[2], inputBuf[3])
             }
         } catch (e: Exception) {
             Log.e(TAG, "Exception in frame loop: $e")
@@ -352,62 +356,88 @@ class XrRenderThread(
     private fun parseUrl(url: String) {
         val m = urlRegex.matchEntire(url.trim())
         if (m != null) {
-            baseUrl   = m.groupValues[1]
-            lastOctet = m.groupValues[2].toIntOrNull() ?: 0
-            urlSuffix = m.groupValues[3]
+            isParseable = true
+            urlScheme = m.groupValues[1]
+            for (i in 0..3) octets[i] = m.groupValues[2 + i].toIntOrNull()?.coerceIn(0, 255) ?: 0
+            urlPort = m.groupValues[6]
         } else {
-            baseUrl   = url
-            lastOctet = -1
-            urlSuffix = ""
+            isParseable = false
+            rawUrl = url
         }
     }
+
+    private fun buildUrl(): String = if (isParseable)
+        "$urlScheme${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}$urlPort"
+    else rawUrl
 
     /**
      * Process one frame of controller input (called on the render thread after
      * nativeRenderFrame returns, while the EGL context is current for GL calls).
+     *
+     * Left thumbstick X → change value of currently selected octet (0–255)
+     * Left thumbstick Y → navigate between octets (left = prev, right = next)
+     * Y button          → toggle panel
+     * A button          → confirm and connect
      */
-    private fun processInput(menuEdge: Boolean, triggerEdge: Boolean, stickX: Float) {
+    private fun processInput(menuEdge: Boolean, triggerEdge: Boolean,
+                             stickX: Float, stickY: Float) {
         // Y button → toggle panel
         if (menuEdge) {
             panelVisible = !panelVisible
             if (panelVisible) {
                 uploadPanelBitmap()
-                Log.i(TAG, "VR panel shown (url=$baseUrl$lastOctet$urlSuffix)")
+                Log.i(TAG, "VR panel shown (url=${buildUrl()})")
             } else {
-                nativeSetPanelTexture(0)
-                if (panelTexId != 0) {
-                    GLES30.glDeleteTextures(1, intArrayOf(panelTexId), 0)
-                    panelTexId = 0
-                }
+                hidePanelTexture()
                 Log.i(TAG, "VR panel hidden")
             }
         }
 
-        if (!panelVisible) return
+        if (!panelVisible || !isParseable) return
 
-        // Left thumbstick X → scroll last IP octet (auto-repeat every 200 ms)
-        if (lastOctet >= 0 && Math.abs(stickX) > 0.5f) {
-            val now = System.currentTimeMillis()
-            if (now - lastOctetChangeMs > 200L) {
-                lastOctetChangeMs = now
-                lastOctet = (lastOctet + if (stickX > 0f) 1 else -1).coerceIn(0, 255)
+        val now = System.currentTimeMillis()
+
+        // Left thumbstick X → change value of current octet
+        if (Math.abs(stickX) > 0.5f) {
+            val delay = if (stickXChangeMs == 0L) 400L else 150L   // initial delay then repeat
+            if (now - stickXChangeMs > delay) {
+                stickXChangeMs = now
+                octets[currentOctetIdx] = (octets[currentOctetIdx] + if (stickX > 0f) 1 else -1)
+                    .coerceIn(0, 255)
                 uploadPanelBitmap()
             }
         } else if (Math.abs(stickX) < 0.2f) {
-            lastOctetChangeMs = 0L   // reset debounce when stick returns to centre
+            stickXChangeMs = 0L
+        }
+
+        // Left thumbstick Y → navigate between octets
+        // Push up (Y > 0.5) = move to previous octet (lower index)
+        // Push down (Y < -0.5) = move to next octet (higher index)
+        if (Math.abs(stickY) > 0.5f) {
+            if (now - stickYChangeMs > 400L) {
+                stickYChangeMs = now
+                currentOctetIdx = (currentOctetIdx + if (stickY > 0f) -1 else 1).coerceIn(0, 3)
+                uploadPanelBitmap()
+            }
+        } else if (Math.abs(stickY) < 0.2f) {
+            stickYChangeMs = 0L
         }
 
         // A button → confirm and connect
         if (triggerEdge) {
-            val url = if (lastOctet >= 0) "$baseUrl$lastOctet$urlSuffix" else baseUrl
+            val url = buildUrl()
             Log.i(TAG, "VR panel confirmed: $url")
             panelVisible = false
-            nativeSetPanelTexture(0)
-            if (panelTexId != 0) {
-                GLES30.glDeleteTextures(1, intArrayOf(panelTexId), 0)
-                panelTexId = 0
-            }
+            hidePanelTexture()
             activity.runOnUiThread { onConnectRequested?.invoke(url) }
+        }
+    }
+
+    private fun hidePanelTexture() {
+        nativeSetPanelTexture(0)
+        if (panelTexId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(panelTexId), 0)
+            panelTexId = 0
         }
     }
 
@@ -443,40 +473,80 @@ class XrRenderThread(
         }
         canvas.drawText("VR CONNECT", pw / 2f, 34f, titlePaint)
 
-        // URL with the editable last-octet highlighted in yellow
         val urlPaint = Paint().apply {
             color = Color.WHITE
-            textSize = 20f
+            textSize = 22f
             isAntiAlias = true
             typeface = mono
         }
         val hlPaint = Paint().apply {
             color = Color.YELLOW
-            textSize = 20f
+            textSize = 22f
             isAntiAlias = true
             typeface = mono
         }
-        val prefix   = baseUrl.ifEmpty { "?" }
-        val octetStr = if (lastOctet >= 0) "$lastOctet" else ""
-        val suffix   = urlSuffix
-        val totalW   = urlPaint.measureText(prefix) +
-                       hlPaint.measureText(octetStr) +
-                       urlPaint.measureText(suffix)
-        var x = (pw - totalW) / 2f
-        val yUrl = 76f
-        canvas.drawText(prefix,   x, yUrl, urlPaint); x += urlPaint.measureText(prefix)
-        canvas.drawText(octetStr, x, yUrl, hlPaint);  x += hlPaint.measureText(octetStr)
-        canvas.drawText(suffix,   x, yUrl, urlPaint)
+        val dotPaint = Paint(urlPaint)
+
+        if (isParseable) {
+            // Build the list of segments: scheme, oct0, ".", oct1, ".", oct2, ".", oct3, port
+            // Selected octet uses hlPaint; everything else uses urlPaint.
+            data class Segment(val text: String, val paint: Paint)
+            val segments = mutableListOf<Segment>()
+            segments += Segment(urlScheme, urlPaint)
+            for (i in 0..3) {
+                segments += Segment(octets[i].toString(), if (i == currentOctetIdx) hlPaint else urlPaint)
+                if (i < 3) segments += Segment(".", dotPaint)
+            }
+            segments += Segment(urlPort, urlPaint)
+
+            val totalW = segments.sumOf { it.paint.measureText(it.text).toDouble() }.toFloat()
+            var x = (pw - totalW) / 2f
+            val yUrl = 82f
+            for (seg in segments) {
+                canvas.drawText(seg.text, x, yUrl, seg.paint)
+                x += seg.paint.measureText(seg.text)
+            }
+
+            // Underline below the selected octet to make cursor obvious
+            val underlinePaint = Paint().apply {
+                color = Color.YELLOW
+                strokeWidth = 2f
+                style = Paint.Style.STROKE
+            }
+            // Recalculate x position of selected octet
+            var ux = (pw - totalW) / 2f
+            for (seg in segments) {
+                val w = seg.paint.measureText(seg.text)
+                if (seg.paint === hlPaint) {
+                    canvas.drawLine(ux, yUrl + 4f, ux + w, yUrl + 4f, underlinePaint)
+                    break
+                }
+                ux += w
+            }
+        } else {
+            // Not parseable: show raw URL centred, no editing
+            urlPaint.textAlign = Paint.Align.CENTER
+            canvas.drawText(rawUrl.take(44), pw / 2f, 82f, urlPaint)
+            val notePaint = Paint().apply {
+                color = Color.argb(180, 255, 180, 100)
+                textSize = 15f
+                isAntiAlias = true
+                typeface = mono
+                textAlign = Paint.Align.CENTER
+            }
+            canvas.drawText("URL format not recognised — edit manually", pw / 2f, 106f, notePaint)
+        }
 
         // Controller hints
         val hintPaint = Paint().apply {
             color = Color.argb(200, 150, 200, 255)
-            textSize = 15f
+            textSize = 14f
             isAntiAlias = true
             typeface = mono
             textAlign = Paint.Align.CENTER
         }
-        canvas.drawText("Stick: change IP  |  A: connect  |  Y: close", pw / 2f, 118f, hintPaint)
+        canvas.drawText("← → change value  ↑ ↓ select octet  A: connect  Y: close",
+                        pw / 2f, 140f, hintPaint)
 
         // Upload to GL texture (create on first use)
         if (panelTexId == 0) {

@@ -298,6 +298,7 @@ static std::atomic<GLuint> g_statusTexId{0};
 static std::atomic<bool>   g_menuEdge{false};     // Y button rising edge
 static std::atomic<bool>   g_triggerEdge{false};  // A button rising edge
 static std::atomic<int>    g_stickXFixed{0};      // left thumbstick X × 1000
+static std::atomic<int>    g_stickYFixed{0};      // left thumbstick Y × 1000
 
 // ── GL helpers ────────────────────────────────────────────────────────────────
 
@@ -408,7 +409,7 @@ struct XrApp {
     XrActionSet actionSet     = XR_NULL_HANDLE;  // "fpv" action set
     XrAction    menuAction    = XR_NULL_HANDLE;  // Y button → toggle VR panel
     XrAction    confirmAction = XR_NULL_HANDLE;  // A button → confirm connection
-    XrAction    stickAction   = XR_NULL_HANDLE;  // left thumbstick X → change IP octet
+    XrAction    stickAction   = XR_NULL_HANDLE;  // left thumbstick XY → change/navigate IP octets
 };
 
 static XrApp g_xr;
@@ -706,13 +707,13 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
                 aci.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
                 xrCreateAction(g_xr.actionSet, &aci, &g_xr.confirmAction);
             }
-            // Left thumbstick X → scroll IP last-octet value
+            // Left thumbstick XY → scroll value (X) and navigate between octets (Y)
             {
                 XrActionCreateInfo aci = {XR_TYPE_ACTION_CREATE_INFO};
-                snprintf(aci.actionName, XR_MAX_ACTION_NAME_SIZE, "stick_x");
+                snprintf(aci.actionName, XR_MAX_ACTION_NAME_SIZE, "stick");
                 snprintf(aci.localizedActionName,
-                         XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "Stick X");
-                aci.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
+                         XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "Stick");
+                aci.actionType = XR_ACTION_TYPE_VECTOR2F_INPUT;
                 xrCreateAction(g_xr.actionSet, &aci, &g_xr.stickAction);
             }
 
@@ -723,7 +724,7 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
             xrStringToPath(g_xr.instance,
                 "/user/hand/right/input/a/click",     &confirmPath);
             xrStringToPath(g_xr.instance,
-                "/user/hand/left/input/thumbstick/x", &stickPath);
+                "/user/hand/left/input/thumbstick", &stickPath);
 
             XrActionSuggestedBinding bindings[] = {
                 {g_xr.menuAction,    menuPath},
@@ -910,13 +911,14 @@ static bool xrApp_renderFrame() {
                 g_triggerEdge.store(true);
             }
         }
-        // Left thumbstick X (continuous value)
+        // Left thumbstick XY (continuous values)
         if (g_xr.stickAction != XR_NULL_HANDLE) {
-            XrActionStateFloat   state = {XR_TYPE_ACTION_STATE_FLOAT};
-            XrActionStateGetInfo info  = {XR_TYPE_ACTION_STATE_GET_INFO};
+            XrActionStateVector2f state = {XR_TYPE_ACTION_STATE_VECTOR2F};
+            XrActionStateGetInfo  info  = {XR_TYPE_ACTION_STATE_GET_INFO};
             info.action = g_xr.stickAction;
-            if (XR_SUCCEEDED(xrGetActionStateFloat(g_xr.session, &info, &state))) {
-                g_stickXFixed.store((int)(state.currentState * 1000.f));
+            if (XR_SUCCEEDED(xrGetActionStateVector2f(g_xr.session, &info, &state))) {
+                g_stickXFixed.store((int)(state.currentState.x * 1000.f));
+                g_stickYFixed.store((int)(state.currentState.y * 1000.f));
             }
         }
     }
@@ -1237,7 +1239,8 @@ Java_com_fpv_quest_XrRenderThread_nativeSetPanelTexture(JNIEnv* /*env*/, jobject
  *
  * out[0]: 1.0 if Y button had a rising edge this frame (menu toggle), else 0.0
  * out[1]: 1.0 if A button had a rising edge this frame (confirm),     else 0.0
- * out[2]: left thumbstick X in [-1.0, 1.0] (continuous)
+ * out[2]: left thumbstick X in [-1.0, 1.0] (continuous) — change octet value
+ * out[3]: left thumbstick Y in [-1.0, 1.0] (continuous) — navigate between octets
  */
 JNIEXPORT void JNICALL
 Java_com_fpv_quest_XrRenderThread_nativeGetLastInputState(JNIEnv* env, jobject /*thiz*/,
@@ -1246,6 +1249,7 @@ Java_com_fpv_quest_XrRenderThread_nativeGetLastInputState(JNIEnv* env, jobject /
     buf[0] = g_menuEdge.exchange(false)    ? 1.f : 0.f;
     buf[1] = g_triggerEdge.exchange(false) ? 1.f : 0.f;
     buf[2] = (float)g_stickXFixed.load() / 1000.f;
+    buf[3] = (float)g_stickYFixed.load() / 1000.f;
     env->ReleaseFloatArrayElements(out, buf, 0);
 }
 
