@@ -286,6 +286,15 @@ static const float STATS_VERTS[] = {
 // the render thread reader.
 static std::atomic<GLuint> g_statsTexId{0};
 
+// VR connection panel texture (set via nativeSetPanelTexture); 0 = hidden.
+static std::atomic<GLuint> g_panelTexId{0};
+
+// Input edge flags — set by xrApp_renderFrame after xrSyncActions,
+// consumed by nativeGetLastInputState (called from Kotlin on the render thread).
+static std::atomic<bool>   g_menuEdge{false};     // Y button rising edge
+static std::atomic<bool>   g_triggerEdge{false};  // A button rising edge
+static std::atomic<int>    g_stickXFixed{0};      // left thumbstick X × 1000
+
 // ── GL helpers ────────────────────────────────────────────────────────────────
 
 static GLuint compileShader(GLenum type, const char* src) {
@@ -390,6 +399,12 @@ struct XrApp {
     float screenHalfH = 0.5625f; // half-height: 16:9 → 1.125 m tall
     float screenDist  = 1.5f;    // 1.5 m away from eyes
     float screenYOff  = 0.0f;    // no vertical offset
+
+    // Input action system (Quest Touch controller buttons + left thumbstick)
+    XrActionSet actionSet     = XR_NULL_HANDLE;  // "fpv" action set
+    XrAction    menuAction    = XR_NULL_HANDLE;  // Y button → toggle VR panel
+    XrAction    confirmAction = XR_NULL_HANDLE;  // A button → confirm connection
+    XrAction    stickAction   = XR_NULL_HANDLE;  // left thumbstick X → change IP octet
 };
 
 static XrApp g_xr;
@@ -657,13 +672,92 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
         }
     }
 
-    // ── 8. Create per-eye swapchains ──────────────────────────────────────────
+    // ── 8. Set up input actions (Quest Touch controller) ──────────────────────
+    // OpenXR action system is a core 1.0 feature — no extra extensions needed.
+    // /interaction_profiles/oculus/touch_controller is natively supported on Quest 2.
+    {
+        XrActionSetCreateInfo asci = {XR_TYPE_ACTION_SET_CREATE_INFO};
+        snprintf(asci.actionSetName, XR_MAX_ACTION_SET_NAME_SIZE, "fpv");
+        snprintf(asci.localizedActionSetName,
+                 XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE, "FPV");
+        asci.priority = 0;
+        if (XR_FAILED(xrCreateActionSet(g_xr.instance, &asci, &g_xr.actionSet))) {
+            LOGW("Input: failed to create action set — controller input disabled");
+        } else {
+            // Y button (left hand) → toggle VR connection panel
+            {
+                XrActionCreateInfo aci = {XR_TYPE_ACTION_CREATE_INFO};
+                snprintf(aci.actionName, XR_MAX_ACTION_NAME_SIZE, "menu");
+                snprintf(aci.localizedActionName,
+                         XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "Menu");
+                aci.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+                xrCreateAction(g_xr.actionSet, &aci, &g_xr.menuAction);
+            }
+            // A button (right hand) → confirm connection
+            {
+                XrActionCreateInfo aci = {XR_TYPE_ACTION_CREATE_INFO};
+                snprintf(aci.actionName, XR_MAX_ACTION_NAME_SIZE, "confirm");
+                snprintf(aci.localizedActionName,
+                         XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "Confirm");
+                aci.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+                xrCreateAction(g_xr.actionSet, &aci, &g_xr.confirmAction);
+            }
+            // Left thumbstick X → scroll IP last-octet value
+            {
+                XrActionCreateInfo aci = {XR_TYPE_ACTION_CREATE_INFO};
+                snprintf(aci.actionName, XR_MAX_ACTION_NAME_SIZE, "stick_x");
+                snprintf(aci.localizedActionName,
+                         XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "Stick X");
+                aci.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
+                xrCreateAction(g_xr.actionSet, &aci, &g_xr.stickAction);
+            }
+
+            // Suggest bindings for Oculus Touch interaction profile
+            XrPath menuPath, confirmPath, stickPath;
+            xrStringToPath(g_xr.instance,
+                "/user/hand/left/input/y/click",      &menuPath);
+            xrStringToPath(g_xr.instance,
+                "/user/hand/right/input/a/click",     &confirmPath);
+            xrStringToPath(g_xr.instance,
+                "/user/hand/left/input/thumbstick/x", &stickPath);
+
+            XrActionSuggestedBinding bindings[] = {
+                {g_xr.menuAction,    menuPath},
+                {g_xr.confirmAction, confirmPath},
+                {g_xr.stickAction,   stickPath},
+            };
+            XrPath profilePath;
+            xrStringToPath(g_xr.instance,
+                "/interaction_profiles/oculus/touch_controller", &profilePath);
+            XrInteractionProfileSuggestedBinding suggested =
+                {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+            suggested.interactionProfile     = profilePath;
+            suggested.countSuggestedBindings = 3;
+            suggested.suggestedBindings      = bindings;
+            if (XR_FAILED(xrSuggestInteractionProfileBindings(g_xr.instance, &suggested))) {
+                LOGW("Input: failed to suggest Oculus Touch bindings");
+            }
+
+            // Attach action set to the session
+            XrSessionActionSetsAttachInfo attachInfo =
+                {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+            attachInfo.countActionSets = 1;
+            attachInfo.actionSets      = &g_xr.actionSet;
+            if (XR_FAILED(xrAttachSessionActionSets(g_xr.session, &attachInfo))) {
+                LOGW("Input: failed to attach action sets");
+            } else {
+                LOGI("Input: action sets attached (Y=menu, A=confirm, leftStick=scroll)");
+            }
+        }
+    }
+
+    // ── 9. Create per-eye swapchains ──────────────────────────────────────────
     for (int eye = 0; eye < 2; ++eye) {
         if (!createSwapchain(g_xr.session, recWidth, recHeight, g_xr.swapchains[eye]))
             return false;
     }
 
-    // ── 9. Compile shaders and build quad geometry ────────────────────────────
+    // ── 10. Compile shaders and build quad geometry ───────────────────────────
     // Attribute locations are declared in the vertex shader via layout(location=N),
     // so no glBindAttribLocation is needed — a single linkProgram() call is correct.
     g_xr.videoProgram = linkProgram(VERT_SRC, FRAG_SRC);
@@ -784,6 +878,45 @@ static bool xrApp_renderFrame() {
     XR_CHECK(xrWaitFrame(g_xr.session, &fwi, &fState));
     XR_CHECK(xrBeginFrame(g_xr.session, nullptr));
 
+    // ── Sync input actions (per OpenXR spec: after xrBeginFrame) ─────────────
+    if (g_xr.actionSet != XR_NULL_HANDLE) {
+        XrActiveActionSet active   = {g_xr.actionSet, XR_NULL_PATH};
+        XrActionsSyncInfo syncInfo = {XR_TYPE_ACTIONS_SYNC_INFO};
+        syncInfo.countActiveActionSets = 1;
+        syncInfo.activeActionSets      = &active;
+        xrSyncActions(g_xr.session, &syncInfo);
+
+        // Y button rising edge
+        if (g_xr.menuAction != XR_NULL_HANDLE) {
+            XrActionStateBoolean state = {XR_TYPE_ACTION_STATE_BOOLEAN};
+            XrActionStateGetInfo info  = {XR_TYPE_ACTION_STATE_GET_INFO};
+            info.action = g_xr.menuAction;
+            if (XR_SUCCEEDED(xrGetActionStateBoolean(g_xr.session, &info, &state)) &&
+                    state.changedSinceLastSync && state.currentState) {
+                g_menuEdge.store(true);
+            }
+        }
+        // A button rising edge
+        if (g_xr.confirmAction != XR_NULL_HANDLE) {
+            XrActionStateBoolean state = {XR_TYPE_ACTION_STATE_BOOLEAN};
+            XrActionStateGetInfo info  = {XR_TYPE_ACTION_STATE_GET_INFO};
+            info.action = g_xr.confirmAction;
+            if (XR_SUCCEEDED(xrGetActionStateBoolean(g_xr.session, &info, &state)) &&
+                    state.changedSinceLastSync && state.currentState) {
+                g_triggerEdge.store(true);
+            }
+        }
+        // Left thumbstick X (continuous value)
+        if (g_xr.stickAction != XR_NULL_HANDLE) {
+            XrActionStateFloat   state = {XR_TYPE_ACTION_STATE_FLOAT};
+            XrActionStateGetInfo info  = {XR_TYPE_ACTION_STATE_GET_INFO};
+            info.action = g_xr.stickAction;
+            if (XR_SUCCEEDED(xrGetActionStateFloat(g_xr.session, &info, &state))) {
+                g_stickXFixed.store((int)(state.currentState * 1000.f));
+            }
+        }
+    }
+
     // ── Locate eye views at predicted display time ────────────────────────────
     XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
     XrViewLocateInfo vli    = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -831,12 +964,12 @@ static bool xrApp_renderFrame() {
         glClearColor(0.f, 0.f, 0.f, 1.f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        if (hasVideo) {
-            // Build view-projection matrix for this eye
-            Mat4 view = Mat4::ViewFromPose(views[eye].pose);
-            Mat4 proj = Mat4::ProjFromFov(views[eye].fov, 0.05f, 100.f);
-            Mat4 vp   = Mat4::Mul(proj, view);
+        // Build view-projection matrix once per eye (reused for all world-space quads)
+        Mat4 view = Mat4::ViewFromPose(views[eye].pose);
+        Mat4 proj = Mat4::ProjFromFov(views[eye].fov, 0.05f, 100.f);
+        Mat4 vp   = Mat4::Mul(proj, view);
 
+        if (hasVideo) {
             glUseProgram(g_xr.videoProgram);
             glUniformMatrix4fv(g_xr.u_viewProj, 1, GL_FALSE, vp.m);
             glUniform1f(g_xr.u_halfW,  g_xr.screenHalfW);
@@ -867,11 +1000,6 @@ static bool xrApp_renderFrame() {
                 LOGI("stats overlay: first draw with texId=%u", statsTexId);
                 s_lastLoggedTexId = statsTexId;
             }
-            // Build VP matrix for this eye (same as video quad)
-            Mat4 view = Mat4::ViewFromPose(views[eye].pose);
-            Mat4 proj = Mat4::ProjFromFov(views[eye].fov, 0.05f, 100.f);
-            Mat4 vp   = Mat4::Mul(proj, view);
-
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glUseProgram(g_xr.statsProgram);
@@ -888,6 +1016,30 @@ static bool xrApp_renderFrame() {
             glBindVertexArray(0);
             glDisable(GL_BLEND);
             checkGlError("draw stats overlay");
+        }
+
+        // ── VR connection panel (world-space quad at eye level, 1.0 m in front) ──
+        // Reuses the stats shader + VAO; placed at (0, 0, -1.0m) — in front of
+        // the video screen (1.5m) so it occludes naturally when visible.
+        // Size: PANEL_HALF_W=0.40m × PANEL_HALF_H=0.125m → 0.8m × 0.25m panel.
+        GLuint panelTexId = g_panelTexId.load();
+        if (panelTexId != 0 && fState.shouldRender) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glUseProgram(g_xr.statsProgram);
+            glUniformMatrix4fv(g_xr.u_statsViewProj, 1, GL_FALSE, vp.m);
+            glUniform1f(g_xr.u_statsHalfW, 0.40f);   // 0.8 m wide
+            glUniform1f(g_xr.u_statsHalfH, 0.125f);  // 0.25 m tall (512:160 ≈ 3.2:1)
+            glUniform1f(g_xr.u_statsCY,    0.0f);    // eye level (LOCAL Y=0)
+            glUniform1f(g_xr.u_statsDist,  1.0f);    // 1.0 m (closer than video at 1.5m)
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, panelTexId);
+            glUniform1i(g_xr.u_statsTex, 0);
+            glBindVertexArray(g_xr.statsVAO);
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+            glBindVertexArray(0);
+            glDisable(GL_BLEND);
+            checkGlError("draw connection panel");
         }
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -939,6 +1091,13 @@ static void xrApp_destroy(JNIEnv* env) {
     if (g_xr.statsEBO)     { glDeleteBuffers(1, &g_xr.statsEBO);      g_xr.statsEBO = 0; }
     if (g_xr.statsProgram) { glDeleteProgram(g_xr.statsProgram);      g_xr.statsProgram = 0; }
     g_statsTexId.store(0);
+    g_panelTexId.store(0);
+
+    // Destroy input actions (action set must be destroyed last)
+    if (g_xr.stickAction   != XR_NULL_HANDLE) { xrDestroyAction(g_xr.stickAction);    g_xr.stickAction   = XR_NULL_HANDLE; }
+    if (g_xr.confirmAction != XR_NULL_HANDLE) { xrDestroyAction(g_xr.confirmAction);  g_xr.confirmAction = XR_NULL_HANDLE; }
+    if (g_xr.menuAction    != XR_NULL_HANDLE) { xrDestroyAction(g_xr.menuAction);     g_xr.menuAction    = XR_NULL_HANDLE; }
+    if (g_xr.actionSet     != XR_NULL_HANDLE) { xrDestroyActionSet(g_xr.actionSet);   g_xr.actionSet     = XR_NULL_HANDLE; }
 
     for (int eye = 0; eye < 2; ++eye) destroySwapchain(g_xr.swapchains[eye]);
 
@@ -1018,6 +1177,36 @@ Java_com_fpv_quest_XrRenderThread_nativeSetStatsTexture(JNIEnv* /*env*/, jobject
                                                         jint texId) {
     LOGI("nativeSetStatsTexture: texId=%d", texId);
     g_statsTexId.store((GLuint)texId);
+}
+
+/**
+ * Set (or clear) the GL_TEXTURE_2D used for the VR connection panel overlay.
+ * Called from XrRenderThread.kt on the render thread.
+ * @param texId  GL texture name > 0 → show panel; 0 → hide.
+ */
+JNIEXPORT void JNICALL
+Java_com_fpv_quest_XrRenderThread_nativeSetPanelTexture(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                        jint texId) {
+    LOGI("nativeSetPanelTexture: texId=%d", texId);
+    g_panelTexId.store((GLuint)texId);
+}
+
+/**
+ * Read and consume the latest controller input state.
+ * Called from Kotlin on the render thread after nativeRenderFrame() returns.
+ *
+ * out[0]: 1.0 if Y button had a rising edge this frame (menu toggle), else 0.0
+ * out[1]: 1.0 if A button had a rising edge this frame (confirm),     else 0.0
+ * out[2]: left thumbstick X in [-1.0, 1.0] (continuous)
+ */
+JNIEXPORT void JNICALL
+Java_com_fpv_quest_XrRenderThread_nativeGetLastInputState(JNIEnv* env, jobject /*thiz*/,
+                                                          jfloatArray out) {
+    jfloat* buf = env->GetFloatArrayElements(out, nullptr);
+    buf[0] = g_menuEdge.exchange(false)    ? 1.f : 0.f;
+    buf[1] = g_triggerEdge.exchange(false) ? 1.f : 0.f;
+    buf[2] = (float)g_stickXFixed.load() / 1000.f;
+    env->ReleaseFloatArrayElements(out, buf, 0);
 }
 
 } // extern "C"

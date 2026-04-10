@@ -41,7 +41,11 @@ import java.util.concurrent.atomic.AtomicReference
 class XrRenderThread(
     private val activity: Activity,
     /** WebRTC decoder's EGL context — we share textures with it. */
-    private val webRtcEglContext: EglBase.Context
+    private val webRtcEglContext: EglBase.Context,
+    /** Server URL to display in the VR connection panel (e.g. "ws://192.168.1.100:8080"). */
+    serverUrl: String = "",
+    /** Called on the main thread when the user confirms a URL via the VR panel. */
+    private val onConnectRequested: ((String) -> Unit)? = null
 ) : Thread("XrRenderThread") {
 
     companion object {
@@ -53,7 +57,16 @@ class XrRenderThread(
         // Stats bitmap dimensions (pixels).
         private const val STATS_W = 256
         private const val STATS_H = 64
+
+        // VR connection panel bitmap dimensions (pixels).
+        private const val PANEL_W = 512
+        private const val PANEL_H = 160
     }
+
+    // Regex: ws(s)://A.B.C.D:port  or  ws://A.B.C.D  (last octet is editable)
+    private val urlRegex = Regex("""^(wss?://\d+\.\d+\.\d+\.)(\d+)(:\d+)?$""")
+
+    init { parseUrl(serverUrl) }
 
     @Volatile private var stopRequested = false
     private var sharedEgl: EglBase? = null
@@ -63,6 +76,15 @@ class XrRenderThread(
     // Element 0: e2eMs (or CLEAR_SENTINEL to hide); element 1: encMs.
     private val pendingStats = AtomicReference<LongArray?>(null)
     private var statsTexId: Int = 0   // GL texture name; 0 = not yet created
+
+    // ── VR connection panel state (render-thread-only fields) ─────────────────
+    private var panelVisible      = false
+    private var baseUrl           = ""   // URL prefix  e.g. "ws://192.168.1."
+    private var lastOctet         = -1   // editable last octet (0..255), -1 = not parseable
+    private var urlSuffix         = ""   // URL suffix  e.g. ":8080"
+    private var panelTexId        = 0    // GL texture name; 0 = not yet created
+    private var lastOctetChangeMs = 0L   // for thumbstick auto-repeat debounce
+    private val inputBuf          = FloatArray(3)  // reused per-frame for nativeGetLastInputState
 
     /**
      * Request a stats HUD update.  Safe to call from any thread.
@@ -77,6 +99,15 @@ class XrRenderThread(
      */
     fun clearStats() {
         pendingStats.set(longArrayOf(CLEAR_SENTINEL, 0L))
+    }
+
+    /**
+     * Update the server URL shown in the VR connection panel.
+     * Safe to call from any thread (the panel reads the fields on the render thread
+     * before the next frame, so worst-case one stale frame is shown).
+     */
+    fun setServerUrl(url: String) {
+        parseUrl(url)
     }
 
     // ── Render thread entry point ─────────────────────────────────────────────
@@ -140,6 +171,9 @@ class XrRenderThread(
                     Log.i(TAG, "nativeRenderFrame returned false — session exiting")
                     break
                 }
+                // Process controller input after nativeRenderFrame (actions already synced in C++)
+                nativeGetLastInputState(inputBuf)
+                processInput(inputBuf[0] > 0.5f, inputBuf[1] > 0.5f, inputBuf[2])
             }
         } catch (e: Exception) {
             Log.e(TAG, "Exception in frame loop: $e")
@@ -149,10 +183,14 @@ class XrRenderThread(
         Log.i(TAG, "frame loop exited — destroying XR")
         MainActivity.nativeDestroyXR()
 
-        // Delete the stats GL texture while the EGL context is still current.
+        // Delete GL textures while the EGL context is still current.
         if (statsTexId != 0) {
             GLES30.glDeleteTextures(1, intArrayOf(statsTexId), 0)
             statsTexId = 0
+        }
+        if (panelTexId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(panelTexId), 0)
+            panelTexId = 0
         }
 
         try {
@@ -228,6 +266,155 @@ class XrRenderThread(
         bmp.recycle()
     }
 
+    // ── URL parsing + VR panel logic ──────────────────────────────────────────
+
+    private fun parseUrl(url: String) {
+        val m = urlRegex.matchEntire(url.trim())
+        if (m != null) {
+            baseUrl   = m.groupValues[1]
+            lastOctet = m.groupValues[2].toIntOrNull() ?: 0
+            urlSuffix = m.groupValues[3]
+        } else {
+            baseUrl   = url
+            lastOctet = -1
+            urlSuffix = ""
+        }
+    }
+
+    /**
+     * Process one frame of controller input (called on the render thread after
+     * nativeRenderFrame returns, while the EGL context is current for GL calls).
+     */
+    private fun processInput(menuEdge: Boolean, triggerEdge: Boolean, stickX: Float) {
+        // Y button → toggle panel
+        if (menuEdge) {
+            panelVisible = !panelVisible
+            if (panelVisible) {
+                uploadPanelBitmap()
+                Log.i(TAG, "VR panel shown (url=$baseUrl$lastOctet$urlSuffix)")
+            } else {
+                nativeSetPanelTexture(0)
+                if (panelTexId != 0) {
+                    GLES30.glDeleteTextures(1, intArrayOf(panelTexId), 0)
+                    panelTexId = 0
+                }
+                Log.i(TAG, "VR panel hidden")
+            }
+        }
+
+        if (!panelVisible) return
+
+        // Left thumbstick X → scroll last IP octet (auto-repeat every 200 ms)
+        if (lastOctet >= 0 && Math.abs(stickX) > 0.5f) {
+            val now = System.currentTimeMillis()
+            if (now - lastOctetChangeMs > 200L) {
+                lastOctetChangeMs = now
+                lastOctet = (lastOctet + if (stickX > 0f) 1 else -1).coerceIn(0, 255)
+                uploadPanelBitmap()
+            }
+        } else if (Math.abs(stickX) < 0.2f) {
+            lastOctetChangeMs = 0L   // reset debounce when stick returns to centre
+        }
+
+        // A button → confirm and connect
+        if (triggerEdge) {
+            val url = if (lastOctet >= 0) "$baseUrl$lastOctet$urlSuffix" else baseUrl
+            Log.i(TAG, "VR panel confirmed: $url")
+            panelVisible = false
+            nativeSetPanelTexture(0)
+            if (panelTexId != 0) {
+                GLES30.glDeleteTextures(1, intArrayOf(panelTexId), 0)
+                panelTexId = 0
+            }
+            activity.runOnUiThread { onConnectRequested?.invoke(url) }
+        }
+    }
+
+    /**
+     * Draw the connection panel Bitmap and upload it to the GL texture.
+     * Must be called on the render thread (EGL context current).
+     */
+    private fun uploadPanelBitmap() {
+        val pw = PANEL_W.toFloat()
+        val ph = PANEL_H.toFloat()
+        val bmp = Bitmap.createBitmap(PANEL_W, PANEL_H, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+
+        // Dark semi-transparent background with blue border
+        val bgPaint = Paint().apply { color = Color.argb(220, 0, 20, 40) }
+        canvas.drawRoundRect(RectF(0f, 0f, pw, ph), 12f, 12f, bgPaint)
+        val borderPaint = Paint().apply {
+            color = Color.argb(255, 0, 120, 200)
+            style = Paint.Style.STROKE
+            strokeWidth = 2f
+        }
+        canvas.drawRoundRect(RectF(1f, 1f, pw - 1f, ph - 1f), 11f, 11f, borderPaint)
+
+        val mono = Typeface.MONOSPACE
+
+        // Title
+        val titlePaint = Paint().apply {
+            color = Color.WHITE
+            textSize = 26f
+            isAntiAlias = true
+            typeface = Typeface.create(mono, Typeface.BOLD)
+            textAlign = Paint.Align.CENTER
+        }
+        canvas.drawText("VR CONNECT", pw / 2f, 34f, titlePaint)
+
+        // URL with the editable last-octet highlighted in yellow
+        val urlPaint = Paint().apply {
+            color = Color.WHITE
+            textSize = 20f
+            isAntiAlias = true
+            typeface = mono
+        }
+        val hlPaint = Paint().apply {
+            color = Color.YELLOW
+            textSize = 20f
+            isAntiAlias = true
+            typeface = mono
+        }
+        val prefix   = baseUrl.ifEmpty { "?" }
+        val octetStr = if (lastOctet >= 0) "$lastOctet" else ""
+        val suffix   = urlSuffix
+        val totalW   = urlPaint.measureText(prefix) +
+                       hlPaint.measureText(octetStr) +
+                       urlPaint.measureText(suffix)
+        var x = (pw - totalW) / 2f
+        val yUrl = 76f
+        canvas.drawText(prefix,   x, yUrl, urlPaint); x += urlPaint.measureText(prefix)
+        canvas.drawText(octetStr, x, yUrl, hlPaint);  x += hlPaint.measureText(octetStr)
+        canvas.drawText(suffix,   x, yUrl, urlPaint)
+
+        // Controller hints
+        val hintPaint = Paint().apply {
+            color = Color.argb(200, 150, 200, 255)
+            textSize = 15f
+            isAntiAlias = true
+            typeface = mono
+            textAlign = Paint.Align.CENTER
+        }
+        canvas.drawText("Stick: change IP  |  A: connect  |  Y: close", pw / 2f, 118f, hintPaint)
+
+        // Upload to GL texture (create on first use)
+        if (panelTexId == 0) {
+            val ids = IntArray(1)
+            GLES30.glGenTextures(1, ids, 0)
+            panelTexId = ids[0]
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, panelTexId)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+            nativeSetPanelTexture(panelTexId)
+            Log.i(TAG, "Created panel GL texture id=$panelTexId")
+        }
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, panelTexId)
+        GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, bmp, 0)
+        bmp.recycle()
+    }
+
     // ── JNI ───────────────────────────────────────────────────────────────────
 
     /**
@@ -235,6 +422,8 @@ class XrRenderThread(
      * Maps to Java_com_fpv_quest_XrRenderThread_nativeSetStatsTexture in xr_renderer.cpp.
      */
     private external fun nativeSetStatsTexture(texId: Int)
+    private external fun nativeSetPanelTexture(texId: Int)
+    private external fun nativeGetLastInputState(out: FloatArray)
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 

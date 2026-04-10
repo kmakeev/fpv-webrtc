@@ -188,8 +188,19 @@ class MainActivity : Activity() {
 
     private fun startXrThread() {
         if (xrThread != null) return
-        xrThread = XrRenderThread(this, eglBase.eglBaseContext).also { it.start() }
-        Log.i(TAG, "XrRenderThread started")
+        val savedUrl = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(PREF_SERVER_URL, DEFAULT_URL) ?: DEFAULT_URL
+        xrThread = XrRenderThread(
+            activity           = this,
+            webRtcEglContext   = eglBase.eglBaseContext,
+            serverUrl          = savedUrl,
+            onConnectRequested = { url ->
+                // Called on main thread when user confirms URL via VR panel (A button)
+                urlInput.setText(url)
+                startConnection()
+            }
+        ).also { it.start() }
+        Log.i(TAG, "XrRenderThread started (url=$savedUrl)")
     }
 
     private fun stopXrThread() {
@@ -210,11 +221,12 @@ class MainActivity : Activity() {
             return
         }
 
-        // Persist the URL
+        // Persist the URL and sync it to the VR panel
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putString(PREF_SERVER_URL, url)
             .apply()
+        xrThread?.setServerUrl(url)
 
         overlay.visibility = View.GONE
         setStatus("Connecting…")
