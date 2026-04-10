@@ -66,8 +66,6 @@ class XrRenderThread(
     // Regex: ws(s)://A.B.C.D[:port]  — captures all 4 octets separately
     private val urlRegex = Regex("""^(wss?://)(\d+)\.(\d+)\.(\d+)\.(\d+)(:\d+)?$""")
 
-    init { parseUrl(serverUrl) }
-
     @Volatile private var stopRequested = false
     private var sharedEgl: EglBase? = null
 
@@ -98,11 +96,18 @@ class XrRenderThread(
     private var urlPort            = ""           // e.g. ":8080" or ""
     private var isParseable        = false        // false if URL doesn't match expected pattern
     private var rawUrl             = ""           // kept as-is when not parseable
-    private var currentOctetIdx    = 3            // which octet is currently selected (0..3)
+    private var currentOctetIdx    = 0            // which octet is currently selected (0..3)
     private var panelTexId         = 0            // GL texture name; 0 = not yet created
-    private var stickXChangeMs     = 0L           // debounce timer for X-axis (change value)
-    private var stickYChangeMs     = 0L           // debounce timer for Y-axis (navigate octet)
+    // Thumbstick state: fires immediately on first threshold crossing, then repeats.
+    private var stickXActive      = false  // stick is above threshold
+    private var stickXLastFireAt  = 0L    // timestamp of last fired event
+    private var stickYActive      = false
+    private var stickYLastFireAt  = 0L
     private val inputBuf           = FloatArray(4) // reused per-frame for nativeGetLastInputState
+
+    // init must come AFTER all field declarations — Kotlin executes init blocks
+    // and property initializers in textual order; octets[] above must exist first.
+    init { parseUrl(serverUrl) }
 
     /**
      * Request a stats HUD update.  Safe to call from any thread.
@@ -374,8 +379,8 @@ class XrRenderThread(
      * Process one frame of controller input (called on the render thread after
      * nativeRenderFrame returns, while the EGL context is current for GL calls).
      *
-     * Left thumbstick X → change value of currently selected octet (0–255)
-     * Left thumbstick Y → navigate between octets (left = prev, right = next)
+     * Left thumbstick X → navigate between octets (left = prev octet, right = next)
+     * Left thumbstick Y → change value of currently selected octet (up = +1, down = -1)
      * Y button          → toggle panel
      * A button          → confirm and connect
      */
@@ -396,31 +401,37 @@ class XrRenderThread(
         if (!panelVisible || !isParseable) return
 
         val now = System.currentTimeMillis()
+        val absX = Math.abs(stickX)
+        val absY = Math.abs(stickY)
 
-        // Left thumbstick X → change value of current octet
-        if (Math.abs(stickX) > 0.5f) {
-            val delay = if (stickXChangeMs == 0L) 400L else 150L   // initial delay then repeat
-            if (now - stickXChangeMs > delay) {
-                stickXChangeMs = now
-                octets[currentOctetIdx] = (octets[currentOctetIdx] + if (stickX > 0f) 1 else -1)
+        // Dominant axis wins — prevents diagonal positions from firing both axes.
+        val xDominant = absX >= absY
+
+        // ── X axis: navigate between octets ──────────────────────────────────
+        // Fires immediately on first threshold crossing, then every 500ms (slow repeat).
+        if (xDominant && absX > 0.80f) {
+            if (!stickXActive || now - stickXLastFireAt > 500L) {
+                stickXActive = true
+                stickXLastFireAt = now
+                currentOctetIdx = (currentOctetIdx + if (stickX > 0f) 1 else -1).coerceIn(0, 3)
+                uploadPanelBitmap()
+            }
+        } else if (absX < 0.4f) {
+            stickXActive = false
+        }
+
+        // ── Y axis: change value of current octet ─────────────────────────────
+        // Fires immediately on first threshold crossing, then every 350ms.
+        if (!xDominant && absY > 0.80f) {
+            if (!stickYActive || now - stickYLastFireAt > 350L) {
+                stickYActive = true
+                stickYLastFireAt = now
+                octets[currentOctetIdx] = (octets[currentOctetIdx] + if (stickY > 0f) 1 else -1)
                     .coerceIn(0, 255)
                 uploadPanelBitmap()
             }
-        } else if (Math.abs(stickX) < 0.2f) {
-            stickXChangeMs = 0L
-        }
-
-        // Left thumbstick Y → navigate between octets
-        // Push up (Y > 0.5) = move to previous octet (lower index)
-        // Push down (Y < -0.5) = move to next octet (higher index)
-        if (Math.abs(stickY) > 0.5f) {
-            if (now - stickYChangeMs > 400L) {
-                stickYChangeMs = now
-                currentOctetIdx = (currentOctetIdx + if (stickY > 0f) -1 else 1).coerceIn(0, 3)
-                uploadPanelBitmap()
-            }
-        } else if (Math.abs(stickY) < 0.2f) {
-            stickYChangeMs = 0L
+        } else if (absY < 0.4f) {
+            stickYActive = false
         }
 
         // A button → confirm and connect
@@ -545,7 +556,7 @@ class XrRenderThread(
             typeface = mono
             textAlign = Paint.Align.CENTER
         }
-        canvas.drawText("← → change value  ↑ ↓ select octet  A: connect  Y: close",
+        canvas.drawText("← → select octet  ↑ ↓ change value  A: connect  Y: close",
                         pw / 2f, 140f, hintPaint)
 
         // Upload to GL texture (create on first use)
