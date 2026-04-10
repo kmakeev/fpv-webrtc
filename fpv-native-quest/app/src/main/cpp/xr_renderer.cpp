@@ -289,6 +289,10 @@ static std::atomic<GLuint> g_statsTexId{0};
 // VR connection panel texture (set via nativeSetPanelTexture); 0 = hidden.
 static std::atomic<GLuint> g_panelTexId{0};
 
+// Status overlay texture (shown in the centre of the screen when no video is
+// available — e.g. "Connecting…" or "No stream").  0 = hidden.
+static std::atomic<GLuint> g_statusTexId{0};
+
 // Input edge flags — set by xrApp_renderFrame after xrSyncActions,
 // consumed by nativeGetLastInputState (called from Kotlin on the render thread).
 static std::atomic<bool>   g_menuEdge{false};     // Y button rising edge
@@ -991,6 +995,30 @@ static bool xrApp_renderFrame() {
             checkGlError("draw video quad");
         }
 
+        // ── Status overlay (shown at video-plane depth when no video) ────────
+        // Placed at (0, 0, -1.5m) — same depth as the video quad so the user
+        // perceives it as text on the blank video screen.
+        // Width 1.6m × height 0.2m (512:80 aspect preserved at video distance).
+        GLuint statusTexId = g_statusTexId.load();
+        if (!hasVideo && statusTexId != 0 && fState.shouldRender) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glUseProgram(g_xr.statsProgram);
+            glUniformMatrix4fv(g_xr.u_statsViewProj, 1, GL_FALSE, vp.m);
+            glUniform1f(g_xr.u_statsHalfW, 0.80f);   // 1.6 m wide
+            glUniform1f(g_xr.u_statsHalfH, 0.10f);   // 0.2 m tall
+            glUniform1f(g_xr.u_statsCY,    0.0f);    // eye level centre
+            glUniform1f(g_xr.u_statsDist,  1.5f);    // same depth as video
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, statusTexId);
+            glUniform1i(g_xr.u_statsTex, 0);
+            glBindVertexArray(g_xr.statsVAO);
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+            glBindVertexArray(0);
+            glDisable(GL_BLEND);
+            checkGlError("draw status overlay");
+        }
+
         // ── Stats overlay (drawn regardless of hasVideo) ──────────────────────
         GLuint statsTexId = g_statsTexId.load();
         if (statsTexId != 0 && fState.shouldRender) {
@@ -1092,6 +1120,7 @@ static void xrApp_destroy(JNIEnv* env) {
     if (g_xr.statsProgram) { glDeleteProgram(g_xr.statsProgram);      g_xr.statsProgram = 0; }
     g_statsTexId.store(0);
     g_panelTexId.store(0);
+    g_statusTexId.store(0);
 
     // Destroy input actions (action set must be destroyed last)
     if (g_xr.stickAction   != XR_NULL_HANDLE) { xrDestroyAction(g_xr.stickAction);    g_xr.stickAction   = XR_NULL_HANDLE; }
@@ -1177,6 +1206,17 @@ Java_com_fpv_quest_XrRenderThread_nativeSetStatsTexture(JNIEnv* /*env*/, jobject
                                                         jint texId) {
     LOGI("nativeSetStatsTexture: texId=%d", texId);
     g_statsTexId.store((GLuint)texId);
+}
+
+/**
+ * Set (or clear) the GL_TEXTURE_2D used for the status overlay (shown when no video).
+ * Called from XrRenderThread.kt on the render thread.
+ */
+JNIEXPORT void JNICALL
+Java_com_fpv_quest_XrRenderThread_nativeSetStatusTexture(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                         jint texId) {
+    LOGI("nativeSetStatusTexture: texId=%d", texId);
+    g_statusTexId.store((GLuint)texId);
 }
 
 /**

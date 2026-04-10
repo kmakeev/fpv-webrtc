@@ -77,6 +77,20 @@ class XrRenderThread(
     private val pendingStats = AtomicReference<LongArray?>(null)
     private var statsTexId: Int = 0   // GL texture name; 0 = not yet created
 
+    // ── Status overlay state (shown in VR when no video is available) ────────
+    // "" (empty) = hide; any text = show that message.
+    // AtomicReference null = no pending update.
+    private val pendingStatus = AtomicReference<String?>(null)
+    private var statusTexId   = 0   // GL texture; 0 = not created
+
+    /**
+     * Show a status message in the VR view (visible when there is no video).
+     * Pass null to hide the status overlay.  Safe to call from any thread.
+     */
+    fun showStatus(msg: String?) {
+        pendingStatus.set(msg ?: "")   // empty string = hide sentinel
+    }
+
     // ── VR connection panel state (render-thread-only fields) ─────────────────
     private var panelVisible      = false
     private var baseUrl           = ""   // URL prefix  e.g. "ws://192.168.1."
@@ -167,6 +181,7 @@ class XrRenderThread(
         try {
             while (!stopRequested) {
                 applyPendingStats()
+                applyPendingStatus()
                 if (!MainActivity.nativeRenderFrame()) {
                     Log.i(TAG, "nativeRenderFrame returned false — session exiting")
                     break
@@ -191,6 +206,10 @@ class XrRenderThread(
         if (panelTexId != 0) {
             GLES30.glDeleteTextures(1, intArrayOf(panelTexId), 0)
             panelTexId = 0
+        }
+        if (statusTexId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(statusTexId), 0)
+            statusTexId = 0
         }
 
         try {
@@ -264,6 +283,68 @@ class XrRenderThread(
         val glErr = GLES30.glGetError()
         if (glErr != GLES30.GL_NO_ERROR) Log.e(TAG, "GL error after texImage2D: 0x${glErr.toString(16)}")
         bmp.recycle()
+        // Always re-register with C++ — after clearStats() sets g_statsTexId=0 the
+        // texture still exists in GL, so on reconnect we must re-notify native.
+        nativeSetStatsTexture(statsTexId)
+    }
+
+    // ── Status overlay ────────────────────────────────────────────────────────
+
+    private fun applyPendingStatus() {
+        val msg = pendingStatus.getAndSet(null) ?: return
+        if (msg.isEmpty()) {
+            nativeSetStatusTexture(0)
+            if (statusTexId != 0) {
+                GLES30.glDeleteTextures(1, intArrayOf(statusTexId), 0)
+                statusTexId = 0
+            }
+        } else {
+            uploadStatusBitmap(msg)
+        }
+    }
+
+    private fun uploadStatusBitmap(msg: String) {
+        val w = 512; val h = 80
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val bg = Paint().apply { color = Color.argb(200, 0, 0, 0) }
+        canvas.drawRoundRect(RectF(0f, 0f, w.toFloat(), h.toFloat()), 12f, 12f, bg)
+        val tp = Paint().apply {
+            color = Color.WHITE
+            textSize = 21f
+            isAntiAlias = true
+            typeface = Typeface.MONOSPACE
+            textAlign = Paint.Align.CENTER
+        }
+        // Word-wrap at ≈ 42 chars per line (two lines max)
+        val words = msg.split(" ")
+        val lines = mutableListOf<String>()
+        var line = ""
+        for (w2 in words) {
+            val candidate = if (line.isEmpty()) w2 else "$line $w2"
+            if (candidate.length > 42 && line.isNotEmpty()) { lines += line; line = w2 }
+            else line = candidate
+        }
+        if (line.isNotEmpty()) lines += line
+        val lineH = 26f
+        val totalH = lines.size * lineH
+        val startY = (h - totalH) / 2f + lineH
+        lines.forEachIndexed { i, l -> canvas.drawText(l, w / 2f, startY + i * lineH, tp) }
+
+        if (statusTexId == 0) {
+            val ids = IntArray(1)
+            GLES30.glGenTextures(1, ids, 0)
+            statusTexId = ids[0]
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, statusTexId)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        }
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, statusTexId)
+        GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, bmp, 0)
+        bmp.recycle()
+        nativeSetStatusTexture(statusTexId)
     }
 
     // ── URL parsing + VR panel logic ──────────────────────────────────────────
@@ -423,6 +504,7 @@ class XrRenderThread(
      */
     private external fun nativeSetStatsTexture(texId: Int)
     private external fun nativeSetPanelTexture(texId: Int)
+    private external fun nativeSetStatusTexture(texId: Int)
     private external fun nativeGetLastInputState(out: FloatArray)
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────

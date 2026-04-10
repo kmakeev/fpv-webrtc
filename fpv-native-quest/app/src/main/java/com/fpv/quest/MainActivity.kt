@@ -233,7 +233,8 @@ class MainActivity : Activity() {
 
         // Tear down any previous session before creating a new one
         teardown()
-        xrThread?.clearStats()   // hide stale HUD from previous session
+        xrThread?.clearStats()                // hide stale E2E HUD from previous session
+        xrThread?.showStatus("Connecting…")   // show in VR while waiting for stream
 
         // Init the WebRTC stack.
         engine = WebRTCEngine()
@@ -253,11 +254,13 @@ class MainActivity : Activity() {
             val e2eMs = engine!!.dataChannel.computeE2E(capture)
             val encMs = encode - capture
             Log.i(TAG, "onTimestamp: e2e=${e2eMs}ms enc=${encMs}ms xrThread=${xrThread != null}")
+            xrThread?.showStatus(null)            // video is flowing — hide status overlay
             xrThread?.updateStats(e2eMs, encMs)   // VR HUD overlay (TASK-006)
             runOnUiThread { setStatus("E2E: ${e2eMs}ms  enc: ${encMs}ms") }
         }
         engine!!.dataChannel.onClosed = {
             xrThread?.clearStats()
+            xrThread?.showStatus("No stream — DataChannel closed")
             runOnUiThread { setStatus("DataChannel closed") }
         }
 
@@ -288,11 +291,18 @@ class MainActivity : Activity() {
                         "connected" -> {
                             // Video will appear automatically in XR swapchain once
                             // nativeUpdateVideoFrame receives frames from EglVideoSink.
+                            xrThread?.showStatus("Connected — waiting for video…")
                         }
                         "disconnected" -> {
                             // Transient ICE state — do NOT kill the XR session.
+                            xrThread?.showStatus("Reconnecting…")
                         }
-                        "failed", "closed" -> {
+                        "failed" -> {
+                            xrThread?.showStatus("Connection failed — check IP/server")
+                            overlay.visibility = View.VISIBLE
+                        }
+                        "closed" -> {
+                            xrThread?.showStatus("Stream closed")
                             overlay.visibility = View.VISIBLE
                         }
                     }
