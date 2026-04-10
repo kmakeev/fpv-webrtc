@@ -51,6 +51,9 @@ class MainActivity : Activity() {
         /** Return the most recently stored OES texture ID (0 if no frame yet). */
         @JvmStatic external fun nativeGetVideoTextureId(): Int
 
+        /** Reset the stored video texture ID to 0 (called on teardown so XR shows status overlay). */
+        @JvmStatic external fun nativeResetVideoState()
+
         /** Copy the most recently stored 3×3 transform matrix (float[9], row-major). */
         @JvmStatic external fun nativeGetVideoTransformMatrix(outMatrix: FloatArray)
 
@@ -273,9 +276,10 @@ class MainActivity : Activity() {
                 engine?.handleRemoteIce(candidate, sdpMLineIndex, sdpMid)
             },
             onDisconnected = {
+                xrThread?.showStatus("No signal — check server address")
                 runOnUiThread {
                     setStatus("Disconnected — check server and reconnect")
-                    // overlay shown via onStatus("disconnected") above
+                    overlay.visibility = View.VISIBLE
                 }
             }
         )
@@ -320,6 +324,9 @@ class MainActivity : Activity() {
         engine?.close()
         engine = null
         eglVideoSink = null
+        // Reset C++ video state so hasVideo=false and the XR status overlay can appear
+        // while waiting for a new stream.
+        nativeResetVideoState()
     }
 
     private fun setStatus(msg: String) {

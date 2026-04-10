@@ -142,6 +142,19 @@ Java_com_fpv_quest_MainActivity_nativeGetVideoTransformMatrix(JNIEnv* env, jobje
     }
 }
 
+/**
+ * Reset the stored video texture ID to 0.
+ * Called from MainActivity.teardown() so that the XR renderer knows there is
+ * no active video stream and can show the status overlay instead of a black quad.
+ * Does NOT delete the GL texture — the EGL context/WebRTC owns its lifetime.
+ */
+JNIEXPORT void JNICALL
+Java_com_fpv_quest_MainActivity_nativeResetVideoState(JNIEnv* /*env*/, jobject /*thiz*/) {
+    g_videoTexId.store(0);
+    g_frameCount.store(0);
+    LOGI("nativeResetVideoState: g_videoTexId cleared");
+}
+
 } // extern "C"
 
 // ── Non-JNI accessors for xr_renderer.cpp ─────────────────────────────────────
