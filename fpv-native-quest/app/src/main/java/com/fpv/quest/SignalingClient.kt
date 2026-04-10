@@ -125,11 +125,24 @@ class SignalingClient(
                     }
                     TYPE_ICE -> {
                         Log.d(TAG, "ice candidate received")
-                        onIce(
-                            msg.getString("candidate"),
-                            msg.getInt("sdpMLineIndex"),
-                            msg.getString("sdpMid")
-                        )
+                        // The streamer (Chrome) sends RTCIceCandidate serialised as a nested
+                        // JSON object: { candidate: { candidate:"...", sdpMLineIndex:0, sdpMid:"0" } }
+                        // The flat format { candidate:"...", sdpMLineIndex:0, sdpMid:"0" } is also
+                        // supported for symmetry with what we send.
+                        val rawCandidate = msg.get("candidate")
+                        if (rawCandidate is org.json.JSONObject) {
+                            onIce(
+                                rawCandidate.optString("candidate", ""),
+                                rawCandidate.optInt("sdpMLineIndex", 0),
+                                rawCandidate.optString("sdpMid", "0")
+                            )
+                        } else {
+                            onIce(
+                                msg.optString("candidate", ""),
+                                msg.optInt("sdpMLineIndex", 0),
+                                msg.optString("sdpMid", "0")
+                            )
+                        }
                     }
                     TYPE_PEER_DISCONNECTED -> {
                         Log.i(TAG, "peer disconnected")

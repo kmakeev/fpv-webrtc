@@ -173,7 +173,7 @@ https://localhost:8080/streamer.html
 | TASK-003 | ✅ | WebRTC сигналинг, H.264 декодинг, плоский SurfaceViewRenderer |
 | TASK-004 | ✅ | Zero-copy OES-текстура (EglVideoSink → video_decoder.cpp) |
 | TASK-005 | ✅ | OpenXR стерео-рендеринг (xr_renderer.cpp + XrRenderThread.kt) |
-| TASK-006 | todo | FPVDataChannel E2E-статистика в VR HUD |
+| TASK-006 | ✅ | FPVDataChannel E2E-статистика в VR HUD (world-space quad над видео, Bitmap→GL_TEXTURE_2D, recentering) |
 
 ### Сборка и запуск
 
@@ -254,7 +254,8 @@ adb logcat -s FPVQuest WebRTCEngine SignalingClient FPVDataChannel xr_renderer v
 
 - **Основной интерфейс** — полоска под кнопками (показывает E2E если доступна, иначе Сеть)
 - **Режим "Смотреть на экране"** — плашка в верхней части видео
-- **VR-режим** — WebGL HUD поверх картинки в шлеме
+- **VR-режим (браузер)** — WebGL HUD поверх картинки в шлеме
+- **VR-режим (нативное приложение)** — world-space quad (GL_TEXTURE_2D Bitmap 256×64 px) над видео-экраном на расстоянии 2 м; обновляется через `XrRenderThread.updateStats()` → `GLUtils.texImage2D()` → `nativeSetStatsTexture()`; скрывается при разрыве DataChannel
 
 ---
 

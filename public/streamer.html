@@ -73,6 +73,9 @@
       const msg = JSON.parse(ev.data);
 
       if (msg.type === 'viewer_ready') {
+        // Пересоздаём PC при каждом новом вьювере — это гарантирует свежий
+        // negotiated DataChannel (id=0) и чистое состояние ICE.
+        initPC();
         setStatus('waiting', 'Вьювер подключился, создаём offer...');
         const offer = await pc.createOffer({
           offerToReceiveVideo: false,
@@ -89,7 +92,14 @@
       }
 
       if (msg.type === 'ice' && msg.candidate) {
-        await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        // msg.candidate may be a full RTCIceCandidate object (from browser viewer)
+        // or a plain SDP string (from the Quest native app's flat format).
+        const init = typeof msg.candidate === 'object'
+          ? msg.candidate
+          : { candidate: msg.candidate,
+              sdpMLineIndex: msg.sdpMLineIndex ?? 0,
+              sdpMid: msg.sdpMid ?? '0' };
+        await pc.addIceCandidate(new RTCIceCandidate(init));
       }
 
       if (msg.type === 'peer_disconnected') {
@@ -103,6 +113,7 @@
 
   // ── PeerConnection ──────────────────────────────────────────────────────
   function initPC() {
+    if (pc) { pc.close(); pc = null; }
     pc = new RTCPeerConnection(ICE_CONFIG);
 
     localStream.getTracks().forEach(track => pc.addTrack(track, localStream));

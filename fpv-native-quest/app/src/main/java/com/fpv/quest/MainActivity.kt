@@ -98,7 +98,8 @@ class MainActivity : Activity() {
     private var eglVideoSink: EglVideoSink? = null
 
     // OpenXR render thread (TASK-005)
-    private var xrThread: XrRenderThread? = null
+    // @Volatile: read from WebRTC IO thread (onTimestamp callback), written on main thread.
+    @Volatile private var xrThread: XrRenderThread? = null
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -220,6 +221,7 @@ class MainActivity : Activity() {
 
         // Tear down any previous session before creating a new one
         teardown()
+        xrThread?.clearStats()   // hide stale HUD from previous session
 
         // Init the WebRTC stack.
         engine = WebRTCEngine()
@@ -238,7 +240,13 @@ class MainActivity : Activity() {
         engine!!.dataChannel.onTimestamp = { capture, encode ->
             val e2eMs = engine!!.dataChannel.computeE2E(capture)
             val encMs = encode - capture
+            Log.i(TAG, "onTimestamp: e2e=${e2eMs}ms enc=${encMs}ms xrThread=${xrThread != null}")
+            xrThread?.updateStats(e2eMs, encMs)   // VR HUD overlay (TASK-006)
             runOnUiThread { setStatus("E2E: ${e2eMs}ms  enc: ${encMs}ms") }
+        }
+        engine!!.dataChannel.onClosed = {
+            xrThread?.clearStats()
+            runOnUiThread { setStatus("DataChannel closed") }
         }
 
         // Build SignalingClient with callbacks that delegate to the engine

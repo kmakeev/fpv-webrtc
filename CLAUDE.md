@@ -178,10 +178,10 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | JS (public/js/) | Kotlin / C++ (com/fpv/quest/ + cpp/) | Статус |
 |-----------------|--------------------------------------|--------|
 | `webrtc-client.js` | `WebRTCEngine.kt` + `SignalingClient.kt` | ✅ TASK-003 |
-| `datachannel.js` | `FPVDataChannel.kt` | ✅ TASK-005 (bind + clock sync; E2E в status bar) |
+| `datachannel.js` | `FPVDataChannel.kt` | ✅ TASK-006 (bind + clock sync; E2E в status bar + VR HUD) |
 | *(нет аналога)* | `EglVideoSink.kt` + `video_decoder.cpp` | ✅ TASK-004 |
 | `webxr-renderer.js` | `xr_renderer.cpp` + `XrRenderThread.kt` | ✅ TASK-005 |
-| `stats.js` | inline в `MainActivity.kt` | ✅ TASK-005 (basic E2E display) |
+| `stats.js` | inline в `MainActivity.kt` + `xr_renderer.cpp` (stats HUD overlay) | ✅ TASK-006 |
 
 ## Ключевые технические ограничения
 
@@ -202,3 +202,6 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - `com.oculus.intent.category.VR` обязателен в манифесте. Без него Quest уничтожает Activity (`onPause→onStop→onDestroy`) при переходе в VR-режим, посылая `XR_SESSION_STATE_STOPPING` сразу после `onPause`. С этой категорией Activity остаётся жива. Приложение авто-подключается к сохранённому URL при старте (`onResume`); первичная настройка URL — через оверлей (виден до захвата XR-фокуса) или ADB.
 - `<meta-data android:name="com.oculus.vr.focusaware" android:value="true" />` обязателен — без него сессия не достигает `XR_SESSION_STATE_FOCUSED` и контроллерный ввод не доставляется.
 - Шейдер использует `samplerExternalOES` + `GL_OES_EGL_image_external_essl3`. ST-матрица (3×3, row-major из Android) передаётся в GLSL с `glUniformMatrix3fv(..., GL_TRUE, ...)` (transpose=true). IPD и FOV берутся из `XrView` (реальные значения шлема), расстояние 1.5 м и ширина экрана 2.0 м совпадают с `webxr-renderer.js`.
+- Stats HUD overlay (TASK-006): `XrRenderThread` держит `AtomicReference<LongArray?>` для thread-safe передачи E2E/encode метрик из IO-потока DataChannel в render thread. Перед каждым `nativeRenderFrame()` render thread проверяет pending-обновление: рисует текст через Android Canvas на Bitmap 256×64 px, загружает как `GL_TEXTURE_2D` через `GLUtils.texImage2D()`, сообщает texture ID в C++ через `nativeSetStatsTexture()` (`g_statsTexId` — `std::atomic<GLuint>`). В `xr_renderer.cpp` overlay рендерится как **world-space quad** (0, 0.95 м, −2.0 м) в LOCAL-пространстве — над видео-экраном на чуть большем расстоянии — с alpha-blending и полной VP-матрицей (стереоскопическая глубина). При закрытии DataChannel `onClosed` callback передаёт texId=0 → overlay скрывается.
+- ICE trickle формат: Chrome сериализует `RTCIceCandidate` как вложенный JSON-объект `{ candidate: { candidate:"...", sdpMLineIndex:0, sdpMid:"0" } }`. `SignalingClient.kt` проверяет тип поля `candidate` — если JSONObject, извлекает поля из вложенного объекта; если строка — читает из плоского формата (для симметрии). `streamer.html` при получении плоского кандидата (от Quest) строит `RTCIceCandidateInit` явно; при объектном (от браузерного вьювера) — передаёт напрямую. Несоответствие форматов приводило к молчаливому дропу всех trickle-кандидатов → ICE не соединялся.
+- Центрирование и reference space: используется `XR_REFERENCE_SPACE_TYPE_LOCAL` (Y=0 = уровень глаз пользователя в момент последнего recentre). При нажатии кнопки Oculus runtime генерирует `XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING`; последующие `xrLocateViews` автоматически возвращают позиции в обновлённом LOCAL-фрейме — контент возвращается по центру без каких-либо действий на стороне приложения. `XR_REFERENCE_SPACE_TYPE_STAGE` (origin на уровне пола) не используется: видео на Y=0 оказывалось бы на уровне пола.

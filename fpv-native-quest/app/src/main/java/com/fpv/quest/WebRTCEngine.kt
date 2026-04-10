@@ -34,9 +34,11 @@ class WebRTCEngine {
     companion object {
         private const val TAG = "WebRTCEngine"
         private const val STUN_SERVER = "stun:stun.l.google.com:19302"
-    }
 
-    private var factory: PeerConnectionFactory? = null
+        // Process-scoped singleton — survives reconnects, never disposed.
+        // PeerConnectionFactory.initialize() is called once on first init().
+        private var factory: PeerConnectionFactory? = null
+    }
     private var pc: PeerConnection? = null
     private var videoTrackRef: VideoTrack? = null
     private var videoSinkRef: VideoSink? = null
@@ -55,23 +57,30 @@ class WebRTCEngine {
      * all required field trials.  Do NOT call it separately before init().
      */
     fun init(context: Context, eglBase: EglBase) {
-        PeerConnectionFactory.initialize(
-            PeerConnectionFactory.InitializationOptions.builder(context)
-                // Minimise jitter-buffer playout delay — reduces buffering latency.
-                .setFieldTrials("WebRTC-MinPlayoutDelay/Enabled/")
-                .createInitializationOptions()
-        )
-        // HardwareVideoDecoderFactory uses MediaCodec + the shared EGL context so the
-        // decoded frame goes directly to the GPU without a CPU copy (TASK-004).
-        // Do NOT use DefaultVideoDecoderFactory — it may select a software decoder.
-        val decoderFactory = HardwareVideoDecoderFactory(eglBase.eglBaseContext)
+        // PeerConnectionFactory.initialize() must be called exactly once per process —
+        // calling it a second time after factory.dispose() corrupts the native layer.
+        // The guard here makes init() safe to call on every reconnect.
+        if (factory == null) {
+            PeerConnectionFactory.initialize(
+                PeerConnectionFactory.InitializationOptions.builder(context)
+                    // Minimise jitter-buffer playout delay — reduces buffering latency.
+                    .setFieldTrials("WebRTC-MinPlayoutDelay/Enabled/")
+                    .createInitializationOptions()
+            )
+            // HardwareVideoDecoderFactory uses MediaCodec + the shared EGL context so the
+            // decoded frame goes directly to the GPU without a CPU copy (TASK-004).
+            // Do NOT use DefaultVideoDecoderFactory — it may select a software decoder.
+            val decoderFactory = HardwareVideoDecoderFactory(eglBase.eglBaseContext)
 
-        factory = PeerConnectionFactory.builder()
-            .setVideoDecoderFactory(decoderFactory)
-            // No encoder factory — this is a receive-only viewer.
-            .createPeerConnectionFactory()
+            factory = PeerConnectionFactory.builder()
+                .setVideoDecoderFactory(decoderFactory)
+                // No encoder factory — this is a receive-only viewer.
+                .createPeerConnectionFactory()
 
-        Log.i(TAG, "PeerConnectionFactory initialized (HardwareVideoDecoder, MinPlayoutDelay)")
+            Log.i(TAG, "PeerConnectionFactory initialized (HardwareVideoDecoder, MinPlayoutDelay)")
+        } else {
+            Log.i(TAG, "PeerConnectionFactory reused (already initialized)")
+        }
     }
 
     /**
@@ -103,6 +112,9 @@ class WebRTCEngine {
         }
 
         pc = factory!!.createPeerConnection(config, object : PeerConnection.Observer {
+            // Note: onDataChannel is NOT used. We create a negotiated DC (id=0) below,
+            // mirroring the streamer side. This is required because the WebRTC Android SDK
+            // does not reliably call onDataChannel for pre-negotiated channels.
 
             // ── ICE ──────────────────────────────────────────────────────────
 
@@ -155,8 +167,8 @@ class WebRTCEngine {
             // ── DataChannel ───────────────────────────────────────────────────
 
             override fun onDataChannel(dc: DataChannel) {
-                Log.i(TAG, "DataChannel received: ${dc.label()}")
-                dataChannel.bind(dc)
+                // Not used: we pre-create a negotiated DC with id=0 below.
+                Log.i(TAG, "onDataChannel (unexpected): label=${dc.label()} state=${dc.state()}")
             }
 
             // ── Connection state ──────────────────────────────────────────────
@@ -175,6 +187,22 @@ class WebRTCEngine {
             }
         })
 
+        // Create negotiated DataChannel (id=0, same as streamer side in datachannel.js).
+        // Must be done before SDP exchange so SCTP knows about id=0 at connection time.
+        // negotiated=true means both sides create the channel themselves — no ondatachannel needed.
+        val dcInit = DataChannel.Init().apply {
+            negotiated = true
+            id = 0
+            ordered = true
+        }
+        val dc = pc!!.createDataChannel("fpv", dcInit)
+        if (dc != null) {
+            Log.i(TAG, "Negotiated DataChannel created: label=${dc.label()} state=${dc.state()}")
+            dataChannel.bind(dc)
+        } else {
+            Log.e(TAG, "Failed to create negotiated DataChannel")
+        }
+
         Log.i(TAG, "PeerConnection created")
     }
 
@@ -191,6 +219,9 @@ class WebRTCEngine {
      *           → signaling.sendAnswer(answer)
      */
     fun handleOffer(sdp: String, signaling: SignalingClient) {
+        // Log m= sections to confirm DataChannel (m=application) is in the offer
+        val sections = sdp.lines().filter { it.startsWith("m=") }
+        Log.i(TAG, "Offer sections (${sections.size}): ${sections.joinToString(" | ")}")
         val offer = SessionDescription(SessionDescription.Type.OFFER, sdp)
         pc?.setRemoteDescription(
             sdpObserver("setRemote") {
@@ -233,8 +264,9 @@ class WebRTCEngine {
         pc?.dispose()
         pc = null
 
-        factory?.dispose()
-        factory = null
+        // factory is intentionally NOT disposed — PeerConnectionFactory is a process-scoped
+        // singleton. Disposing and recreating it within one process lifetime causes native
+        // layer corruption on the next PeerConnectionFactory.initialize() call.
 
         Log.i(TAG, "closed")
     }

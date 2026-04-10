@@ -215,6 +215,77 @@ void main() {
 }
 )glsl";
 
+// Stats overlay (GL_TEXTURE_2D bitmap uploaded from XrRenderThread.kt via GLUtils):
+//   World-space quad placed above the video screen at a greater distance.
+//   Uses the same view-projection matrix as the video quad so it participates in
+//   stereoscopic depth — appears to float farther away than the video plane.
+//   Alpha blending lets the semi-transparent background from the Kotlin Canvas show through.
+
+static const char* STATS_VERT_SRC = R"glsl(
+#version 300 es
+layout(location = 0) in vec2 a_pos;
+layout(location = 1) in vec2 a_uv;
+uniform mat4 u_viewProj;
+uniform float u_halfW;
+uniform float u_halfH;
+uniform float u_cy;
+uniform float u_dist;
+out vec2 v_uv;
+void main() {
+    // Place HUD quad in world space above the video plane.
+    // a_pos is in [-1, 1]; scaled to metres in world space.
+    vec4 wp = vec4(a_pos.x * u_halfW,
+                   a_pos.y * u_halfH + u_cy,
+                   -u_dist,
+                   1.0);
+    gl_Position = u_viewProj * wp;
+    v_uv = a_uv;
+}
+)glsl";
+
+static const char* STATS_FRAG_SRC = R"glsl(
+#version 300 es
+precision mediump float;
+uniform sampler2D u_stats;
+in vec2 v_uv;
+out vec4 outColor;
+void main() {
+    vec4 c = texture(u_stats, v_uv);
+    if (c.a < 0.05) discard;
+    outColor = c;
+}
+)glsl";
+
+// Stats quad geometry — positions in [-1, 1] (scaled to metres by the vertex shader).
+// UV y is flipped: OpenGL stores Bitmap rows bottom-up (GLUtils.texImage2D passes
+// Android rows top-to-bottom), so uv.y=0 samples the TOP of the Bitmap and uv.y=1
+// samples the BOTTOM.  The flip ensures text appears right-side up on screen.
+//
+// World-space placement constants — defined here for the vertex shader uniforms:
+//   STATS_HALF_W / STATS_HALF_H  : half-size in metres (256:64 = 4:1 aspect)
+//   STATS_CENTER_Y               : centre height in LOCAL space (above video top edge)
+//   STATS_DIST                   : distance from viewer (greater than video 1.5 m)
+//
+// Placement geometry:
+//   Video top edge angular elevation: arctan(0.5625 / 1.5) ≈ 20.6°
+//   HUD bottom edge elevation: arctan((0.95 − 0.0625) / 2.0) ≈ 23.8°  → ~3° gap above video.
+static const float STATS_HALF_W   = 0.25f;   // 0.5 m total width
+static const float STATS_HALF_H   = 0.0625f; // 0.125 m total height (4:1 aspect)
+static const float STATS_CENTER_Y = 0.95f;   // 0.95 m above LOCAL origin (eye level)
+static const float STATS_DIST     = 2.0f;    // 2.0 m (farther than video at 1.5 m)
+
+static const float STATS_VERTS[] = {
+    -1.f, -1.f,  0.f, 1.f,   // bottom-left   (uv.y=1 → Bitmap bottom)
+     1.f, -1.f,  1.f, 1.f,   // bottom-right
+     1.f,  1.f,  1.f, 0.f,   // top-right     (uv.y=0 → Bitmap top)
+    -1.f,  1.f,  0.f, 0.f,   // top-left
+};
+
+// GL texture ID set by XrRenderThread via nativeSetStatsTexture().
+// 0 = nothing to draw.  Atomic so the JNI setter (any thread) races safely with
+// the render thread reader.
+static std::atomic<GLuint> g_statsTexId{0};
+
 // ── GL helpers ────────────────────────────────────────────────────────────────
 
 static GLuint compileShader(GLenum type, const char* src) {
@@ -297,10 +368,22 @@ struct XrApp {
     GLint           u_video      = -1;
     GLint           u_stMat      = -1;
 
-    // Quad geometry
+    // Video quad geometry
     GLuint          quadVAO      = 0;
     GLuint          quadVBO      = 0;
     GLuint          quadEBO      = 0;
+
+    // Stats overlay shader + quad (world-space)
+    GLuint          statsProgram    = 0;
+    GLint           u_statsViewProj = -1;
+    GLint           u_statsHalfW    = -1;
+    GLint           u_statsHalfH    = -1;
+    GLint           u_statsCY       = -1;
+    GLint           u_statsDist     = -1;
+    GLint           u_statsTex      = -1;
+    GLuint          statsVAO        = 0;
+    GLuint          statsVBO        = 0;
+    GLuint          statsEBO        = 0;
 
     // Virtual screen parameters (matching webxr-renderer.js defaults)
     float screenHalfW = 1.0f;    // half-width  = 1 m  → screen 2 m wide
@@ -390,7 +473,8 @@ static const float QUAD_VERTS[] = {
 };
 static const uint16_t QUAD_IDX[] = {0, 1, 2,  0, 2, 3};
 
-static bool createQuadGeometry(GLuint& vao, GLuint& vbo, GLuint& ebo) {
+static bool createQuadGeometry(GLuint& vao, GLuint& vbo, GLuint& ebo,
+                               const float* verts, size_t vertsSize) {
     glGenVertexArrays(1, &vao);
     glGenBuffers(1, &vbo);
     glGenBuffers(1, &ebo);
@@ -398,7 +482,7 @@ static bool createQuadGeometry(GLuint& vao, GLuint& vbo, GLuint& ebo) {
     glBindVertexArray(vao);
 
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(QUAD_VERTS), QUAD_VERTS, GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertsSize, verts, GL_STATIC_DRAW);
 
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(QUAD_IDX), QUAD_IDX, GL_STATIC_DRAW);
@@ -551,17 +635,25 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
     }
 
     // ── 7. Create reference space ─────────────────────────────────────────────
+    // LOCAL: origin at the last recentre position (≈ eye level).  When the user
+    // presses and holds the Oculus button, the runtime fires
+    // XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING and subsequent
+    // xrLocateViews calls return poses in the updated LOCAL frame — the video
+    // quad at (0, 0, −1.5) always re-centres to eye level and straight ahead.
+    // STAGE (floor-level origin) is intentionally not preferred here because
+    // placing content at Y=0 in STAGE space would put it at floor level.
     {
         XrReferenceSpaceCreateInfo rsci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-        rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+        rsci.referenceSpaceType   = XR_REFERENCE_SPACE_TYPE_LOCAL;
         rsci.poseInReferenceSpace = {{0, 0, 0, 1}, {0, 0, 0}};
         if (XR_FAILED(xrCreateReferenceSpace(g_xr.session, &rsci, &g_xr.appSpace))) {
-            // Fall back to LOCAL space (no guaranteed floor origin)
-            rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+            // LOCAL is always supported per spec; log if it somehow fails
+            LOGE("LOCAL reference space unavailable — falling back to STAGE");
+            rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
             XR_CHECK(xrCreateReferenceSpace(g_xr.session, &rsci, &g_xr.appSpace));
-            LOGW("STAGE space unavailable, using LOCAL");
+            LOGI("Reference space: STAGE (fallback)");
         } else {
-            LOGI("Reference space: STAGE");
+            LOGI("Reference space: LOCAL (recentering supported via Oculus button)");
         }
     }
 
@@ -589,8 +681,27 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
          g_xr.u_viewProj, g_xr.u_halfW, g_xr.u_halfH, g_xr.u_dist,
          g_xr.u_yOff, g_xr.u_video, g_xr.u_stMat);
 
-    if (!createQuadGeometry(g_xr.quadVAO, g_xr.quadVBO, g_xr.quadEBO))
+    if (!createQuadGeometry(g_xr.quadVAO, g_xr.quadVBO, g_xr.quadEBO,
+                            QUAD_VERTS, sizeof(QUAD_VERTS)))
         return false;
+
+    // ── Stats overlay shader + quad ───────────────────────────────────────────
+    g_xr.statsProgram = linkProgram(STATS_VERT_SRC, STATS_FRAG_SRC);
+    if (!g_xr.statsProgram) { LOGE("Stats shader link failed"); return false; }
+    g_xr.u_statsViewProj = glGetUniformLocation(g_xr.statsProgram, "u_viewProj");
+    g_xr.u_statsHalfW    = glGetUniformLocation(g_xr.statsProgram, "u_halfW");
+    g_xr.u_statsHalfH    = glGetUniformLocation(g_xr.statsProgram, "u_halfH");
+    g_xr.u_statsCY       = glGetUniformLocation(g_xr.statsProgram, "u_cy");
+    g_xr.u_statsDist     = glGetUniformLocation(g_xr.statsProgram, "u_dist");
+    g_xr.u_statsTex      = glGetUniformLocation(g_xr.statsProgram, "u_stats");
+    LOGI("Stats program=%u viewProj=%d halfW=%d halfH=%d cy=%d dist=%d tex=%d",
+         g_xr.statsProgram, g_xr.u_statsViewProj, g_xr.u_statsHalfW,
+         g_xr.u_statsHalfH, g_xr.u_statsCY, g_xr.u_statsDist, g_xr.u_statsTex);
+
+    if (!createQuadGeometry(g_xr.statsVAO, g_xr.statsVBO, g_xr.statsEBO,
+                            STATS_VERTS, sizeof(STATS_VERTS)))
+        return false;
+    LOGI("Stats VAO=%u VBO=%u EBO=%u", g_xr.statsVAO, g_xr.statsVBO, g_xr.statsEBO);
 
     LOGI("xr_renderer: init complete — session created, shaders compiled");
     return true;
@@ -627,6 +738,15 @@ static bool xrApp_pollEvents() {
                            g_xr.sessionState == XR_SESSION_STATE_LOSS_PENDING) {
                     g_xr.exitRequested = true;
                 }
+                break;
+            }
+            case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
+                // Fired when the user recentres via the Oculus button.
+                // No action needed: subsequent xrLocateViews will return poses
+                // in the updated LOCAL frame automatically.
+                auto* e = reinterpret_cast<XrEventDataReferenceSpaceChangePending*>(&event);
+                LOGI("Reference space change pending (type=%d) — recentre applied",
+                     (int)e->referenceSpaceType);
                 break;
             }
             case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
@@ -738,6 +858,38 @@ static bool xrApp_renderFrame() {
             checkGlError("draw video quad");
         }
 
+        // ── Stats overlay (drawn regardless of hasVideo) ──────────────────────
+        GLuint statsTexId = g_statsTexId.load();
+        if (statsTexId != 0 && fState.shouldRender) {
+            // Log once when first drawn (eye==0 only to avoid duplicates)
+            static GLuint s_lastLoggedTexId = 0;
+            if (eye == 0 && statsTexId != s_lastLoggedTexId) {
+                LOGI("stats overlay: first draw with texId=%u", statsTexId);
+                s_lastLoggedTexId = statsTexId;
+            }
+            // Build VP matrix for this eye (same as video quad)
+            Mat4 view = Mat4::ViewFromPose(views[eye].pose);
+            Mat4 proj = Mat4::ProjFromFov(views[eye].fov, 0.05f, 100.f);
+            Mat4 vp   = Mat4::Mul(proj, view);
+
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glUseProgram(g_xr.statsProgram);
+            glUniformMatrix4fv(g_xr.u_statsViewProj, 1, GL_FALSE, vp.m);
+            glUniform1f(g_xr.u_statsHalfW, STATS_HALF_W);
+            glUniform1f(g_xr.u_statsHalfH, STATS_HALF_H);
+            glUniform1f(g_xr.u_statsCY,    STATS_CENTER_Y);
+            glUniform1f(g_xr.u_statsDist,  STATS_DIST);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, statsTexId);
+            glUniform1i(g_xr.u_statsTex, 0);
+            glBindVertexArray(g_xr.statsVAO);
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+            glBindVertexArray(0);
+            glDisable(GL_BLEND);
+            checkGlError("draw stats overlay");
+        }
+
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
         // Release swapchain image
@@ -782,6 +934,11 @@ static void xrApp_destroy(JNIEnv* env) {
     if (g_xr.quadVBO)      { glDeleteBuffers(1, &g_xr.quadVBO);       g_xr.quadVBO = 0; }
     if (g_xr.quadEBO)      { glDeleteBuffers(1, &g_xr.quadEBO);       g_xr.quadEBO = 0; }
     if (g_xr.videoProgram) { glDeleteProgram(g_xr.videoProgram);      g_xr.videoProgram = 0; }
+    if (g_xr.statsVAO)     { glDeleteVertexArrays(1, &g_xr.statsVAO); g_xr.statsVAO = 0; }
+    if (g_xr.statsVBO)     { glDeleteBuffers(1, &g_xr.statsVBO);      g_xr.statsVBO = 0; }
+    if (g_xr.statsEBO)     { glDeleteBuffers(1, &g_xr.statsEBO);      g_xr.statsEBO = 0; }
+    if (g_xr.statsProgram) { glDeleteProgram(g_xr.statsProgram);      g_xr.statsProgram = 0; }
+    g_statsTexId.store(0);
 
     for (int eye = 0; eye < 2; ++eye) destroySwapchain(g_xr.swapchains[eye]);
 
@@ -848,6 +1005,19 @@ JNIEXPORT void JNICALL
 Java_com_fpv_quest_MainActivity_nativeDestroyXR(JNIEnv* env, jclass /*clazz*/) {
     LOGI("nativeDestroyXR()");
     xrApp_destroy(env);
+}
+
+/**
+ * Set (or clear) the GL_TEXTURE_2D used for the stats HUD overlay.
+ * Called from XrRenderThread.kt after uploading a Bitmap via GLUtils.texImage2D().
+ *
+ * @param texId  GL texture name > 0 → show overlay; 0 → hide.
+ */
+JNIEXPORT void JNICALL
+Java_com_fpv_quest_XrRenderThread_nativeSetStatsTexture(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                        jint texId) {
+    LOGI("nativeSetStatsTexture: texId=%d", texId);
+    g_statsTexId.store((GLuint)texId);
 }
 
 } // extern "C"

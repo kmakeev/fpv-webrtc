@@ -2,8 +2,8 @@
  * datachannel.js
  * Общий модуль WebRTC DataChannel для стримера и вьювера.
  *
- * Стример:  FPVDataChannel.create(pc)  — создаёт канал 'fpv'
- * Вьювер:   FPVDataChannel.accept(pc)  — принимает канал через ondatachannel
+ * Стример:  FPVDataChannel.create(pc)  — создаёт negotiated канал 'fpv' (id=0)
+ * Вьювер:   FPVDataChannel.accept(pc)  — создаёт negotiated канал 'fpv' (id=0), до SDP exchange
  *
  * Синхронизация часов (NTP-подобная, 5 round-trips, вьювер инициирует):
  *   clockOffset = streamer_clock - viewer_clock (мс)
@@ -128,19 +128,21 @@
      * Вызывать до createOffer() — чтобы DC попал в SDP.
      */
     create(pc) {
-      const dc = pc.createDataChannel('fpv', { ordered: true });
+      // negotiated: true + id: 0 — обе стороны создают канал с одним id,
+      // SCTP сам свяжет их без ondatachannel события.
+      // Совместимо с нативным приложением (Android SDK не всегда вызывает onDataChannel).
+      const dc = pc.createDataChannel('fpv', { ordered: true, negotiated: true, id: 0 });
       _attachDc(dc);
       return dc;
     },
 
     /**
-     * Вьювер: подписаться на входящий DataChannel от стримера.
-     * Вызывать сразу после создания RTCPeerConnection.
+     * Вьювер: создать negotiated DataChannel (зеркало стримера).
+     * Вызывать до setRemoteDescription — чтобы SCTP знал об id=0 до установки соединения.
      */
     accept(pc) {
-      pc.ondatachannel = (ev) => {
-        _attachDc(ev.channel);
-      };
+      const dc = pc.createDataChannel('fpv', { ordered: true, negotiated: true, id: 0 });
+      _attachDc(dc);
     },
 
     /**

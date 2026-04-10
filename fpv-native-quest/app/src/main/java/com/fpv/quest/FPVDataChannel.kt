@@ -8,6 +8,8 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 import org.webrtc.DataChannel
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * DataChannel handler — Kotlin equivalent of public/js/datachannel.js.
@@ -26,6 +28,12 @@ import java.nio.ByteBuffer
  *
  * E2E latency calculation:
  *   e2eMs = System.currentTimeMillis() - capture + clockOffset
+ *
+ * Thread-safety notes:
+ *   handleMessage/handlePong/handleTimestamp are called on the WebRTC internal thread.
+ *   syncClocks runs on Dispatchers.IO.
+ *   clockSynced and clockOffset are @Volatile for cross-thread visibility.
+ *   pendingPings uses ConcurrentHashMap; collectedOffsets uses CopyOnWriteArrayList.
  */
 class FPVDataChannel {
 
@@ -38,13 +46,18 @@ class FPVDataChannel {
 
     private val scope = CoroutineScope(Dispatchers.IO)
 
-    /** Offset: streamer clock − viewer clock (ms).  Positive → streamer ahead. */
-    private var clockOffset: Long = 0L
-    private var clockSynced = false
+    /** Offset: streamer clock − viewer clock (ms).  Positive → streamer ahead.
+     *  @Volatile: written by IO coroutine, read by WebRTC message thread. */
+    @Volatile private var clockOffset: Long = 0L
 
-    // Pending ping round-trips: id → t0
-    private val pendingPings = mutableMapOf<Int, Long>()
-    private val collectedOffsets = mutableListOf<Long>()
+    /** @Volatile: written by IO coroutine, read by WebRTC message thread via handleTimestamp. */
+    @Volatile private var clockSynced = false
+
+    // ConcurrentHashMap: IO coroutine writes pendingPings[i], WebRTC thread reads/removes on pong.
+    private val pendingPings = ConcurrentHashMap<Int, Long>()
+
+    // CopyOnWriteArrayList: WebRTC thread appends on pong, IO coroutine reads after all pings done.
+    private val collectedOffsets = CopyOnWriteArrayList<Long>()
 
     /** Called when clock sync completes. Param: offset in ms. */
     var onClockSynced: ((offsetMs: Long) -> Unit)? = null
@@ -52,8 +65,11 @@ class FPVDataChannel {
     /** Called on each "ts" message from the streamer. */
     var onTimestamp: ((captureMs: Long, encodeMs: Long) -> Unit)? = null
 
+    /** Called when the DataChannel enters CLOSING or CLOSED state. */
+    var onClosed: (() -> Unit)? = null
+
     /** Send a JSON message over the DataChannel. Set by bind(). */
-    private var sendFn: ((String) -> Unit)? = null
+    @Volatile private var sendFn: ((String) -> Unit)? = null
 
     fun setSendFunction(fn: (String) -> Unit) {
         sendFn = fn
@@ -77,7 +93,10 @@ class FPVDataChannel {
                 when (dc.state()) {
                     DataChannel.State.OPEN    -> scheduleSync()
                     DataChannel.State.CLOSED,
-                    DataChannel.State.CLOSING -> sendFn = null
+                    DataChannel.State.CLOSING -> {
+                        sendFn = null
+                        onClosed?.invoke()
+                    }
                     else                      -> {}
                 }
             }
@@ -91,6 +110,15 @@ class FPVDataChannel {
 
             override fun onBufferedAmountChange(previousAmount: Long) {}
         })
+
+        // Mirror datachannel.js lines 101-105:
+        // onDataChannel fires on the viewer when the channel is already OPEN (streamer created
+        // it before createOffer). In that case onStateChange(OPEN) was delivered before we
+        // registered the observer, so scheduleSync() would never be called — kick it manually.
+        if (dc.state() == DataChannel.State.OPEN) {
+            Log.i(TAG, "DataChannel already OPEN at bind() — scheduling sync immediately")
+            scheduleSync()
+        }
     }
 
     /** Handle an incoming DataChannel message (JSON string). */
@@ -119,9 +147,14 @@ class FPVDataChannel {
     }
 
     private fun handleTimestamp(msg: JSONObject) {
-        if (!clockSynced) return
+        if (!clockSynced) {
+            Log.i(TAG, "ts received but clockSynced=false — skipping (sync pending)")
+            return
+        }
         val capture = msg.getLong("capture")
         val encode  = msg.getLong("encode")
+        val e2e = System.currentTimeMillis() - capture + clockOffset
+        Log.i(TAG, "ts dispatched: e2e=${e2e}ms offset=${clockOffset}ms cbNull=${onTimestamp == null}")
         onTimestamp?.invoke(capture, encode)
     }
 
@@ -163,7 +196,7 @@ class FPVDataChannel {
         }
 
         clockOffset = median(collectedOffsets)
-        clockSynced = true
+        clockSynced = true   // @Volatile write — immediately visible to all threads
         Log.i(TAG, "Clock sync complete: offset=${clockOffset}ms (${collectedOffsets.size} samples)")
         onClockSynced?.invoke(clockOffset)
     }
