@@ -188,14 +188,15 @@ static const char* VERT_SRC = R"glsl(
 #version 300 es
 layout(location = 0) in vec2 a_pos;
 layout(location = 1) in vec2 a_uv;
-uniform mat4 u_viewProj;
+uniform mat4  u_viewProj;
 uniform float u_halfW;
 uniform float u_halfH;
-uniform float u_dist;
-uniform float u_yOff;
+uniform float u_px;   // TASK-009: panel centre X (metres, world space)
+uniform float u_py;   // TASK-009: panel centre Y
+uniform float u_pz;   // TASK-009: panel centre Z (negative = in front of viewer)
 out vec2 v_uv;
 void main() {
-    vec4 wp = vec4(a_pos.x * u_halfW, a_pos.y * u_halfH + u_yOff, -u_dist, 1.0);
+    vec4 wp = vec4(a_pos.x * u_halfW + u_px, a_pos.y * u_halfH + u_py, u_pz, 1.0);
     gl_Position = u_viewProj * wp;
     v_uv = a_uv;
 }
@@ -225,16 +226,17 @@ static const char* STATS_VERT_SRC = R"glsl(
 #version 300 es
 layout(location = 0) in vec2 a_pos;
 layout(location = 1) in vec2 a_uv;
-uniform mat4 u_viewProj;
+uniform mat4  u_viewProj;
 uniform float u_halfW;
 uniform float u_halfH;
+uniform float u_cx;   // TASK-009: horizontal centre offset (follows panel X)
 uniform float u_cy;
 uniform float u_dist;
 out vec2 v_uv;
 void main() {
     // Place HUD quad in world space above the video plane.
     // a_pos is in [-1, 1]; scaled to metres in world space.
-    vec4 wp = vec4(a_pos.x * u_halfW,
+    vec4 wp = vec4(a_pos.x * u_halfW + u_cx,
                    a_pos.y * u_halfH + u_cy,
                    -u_dist,
                    1.0);
@@ -299,6 +301,24 @@ static std::atomic<bool>   g_menuEdge{false};     // Y button rising edge
 static std::atomic<bool>   g_triggerEdge{false};  // A button rising edge
 static std::atomic<int>    g_stickXFixed{0};      // left thumbstick X × 1000
 static std::atomic<int>    g_stickYFixed{0};      // left thumbstick Y × 1000
+
+// ── TASK-009: Panel transform (grab & scale) ──────────────────────────────────
+// g_panel holds the current world-space position and size of the video quad.
+// All drag/scale logic runs on the render thread (inside xrApp_renderFrame)
+// and writes directly to g_panel — no JNI crossing per frame.
+struct PanelTransform {
+    XrPosef pose   = { {0.f,0.f,0.f,1.f}, {0.f, 0.f, -1.5f} }; // identity rot, 1.5 m in front
+    float   width  = 2.0f;    // metres (default matches webxr-renderer.js)
+    float   height = 1.125f;  // 16:9
+};
+static PanelTransform g_panel;
+
+// Drag state machine: tracks grip-held state and previous aim position.
+struct DragState {
+    bool       active  = false;
+    XrVector3f prevAim = {0.f, 0.f, 0.f};
+};
+static DragState g_drag;
 
 // ── GL helpers ────────────────────────────────────────────────────────────────
 
@@ -377,8 +397,9 @@ struct XrApp {
     GLint           u_viewProj   = -1;
     GLint           u_halfW      = -1;
     GLint           u_halfH      = -1;
-    GLint           u_dist       = -1;
-    GLint           u_yOff       = -1;
+    GLint           u_px         = -1;  // TASK-009: panel centre X
+    GLint           u_py         = -1;  // TASK-009: panel centre Y
+    GLint           u_pz         = -1;  // TASK-009: panel centre Z
     GLint           u_video      = -1;
     GLint           u_stMat      = -1;
 
@@ -392,6 +413,7 @@ struct XrApp {
     GLint           u_statsViewProj = -1;
     GLint           u_statsHalfW    = -1;
     GLint           u_statsHalfH    = -1;
+    GLint           u_statsCX       = -1;  // TASK-009: overlay centre X (follows panel)
     GLint           u_statsCY       = -1;
     GLint           u_statsDist     = -1;
     GLint           u_statsTex      = -1;
@@ -399,17 +421,18 @@ struct XrApp {
     GLuint          statsVBO        = 0;
     GLuint          statsEBO        = 0;
 
-    // Virtual screen parameters (matching webxr-renderer.js defaults)
-    float screenHalfW = 1.0f;    // half-width  = 1 m  → screen 2 m wide
-    float screenHalfH = 0.5625f; // half-height: 16:9 → 1.125 m tall
-    float screenDist  = 1.5f;    // 1.5 m away from eyes
-    float screenYOff  = 0.0f;    // no vertical offset
-
-    // Input action system (Quest Touch controller buttons + left thumbstick)
-    XrActionSet actionSet     = XR_NULL_HANDLE;  // "fpv" action set
-    XrAction    menuAction    = XR_NULL_HANDLE;  // Y button → toggle VR panel
-    XrAction    confirmAction = XR_NULL_HANDLE;  // A button → confirm connection
-    XrAction    stickAction   = XR_NULL_HANDLE;  // left thumbstick XY → change/navigate IP octets
+    // Input action system (Quest Touch controller buttons + thumbsticks)
+    XrActionSet actionSet        = XR_NULL_HANDLE;  // "fpv" action set
+    XrAction    menuAction       = XR_NULL_HANDLE;  // Y button → toggle VR panel
+    XrAction    confirmAction    = XR_NULL_HANDLE;  // A button → confirm connection
+    XrAction    stickAction      = XR_NULL_HANDLE;  // left thumbstick XY → change/navigate IP octets
+    // TASK-009: grab & scale panel
+    // gripAction is FLOAT because Oculus Touch only exposes /squeeze/value (0..1),
+    // not /squeeze/click.  We threshold at 0.5 to derive a boolean held-state.
+    XrAction    gripAction       = XR_NULL_HANDLE;  // right squeeze/value → drag panel
+    XrAction    rightStickAction = XR_NULL_HANDLE;  // right thumbstick Y → scale during grip
+    XrAction    rightAimAction   = XR_NULL_HANDLE;  // right aim pose
+    XrSpace     rightAimSpace    = XR_NULL_HANDLE;
 
     // TASK-007: XR_EXT_performance_settings — CPU/GPU clock boost for low latency.
     // Function pointer loaded from the instance after xrCreateInstance; null if extension
@@ -774,20 +797,58 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
                 aci.actionType = XR_ACTION_TYPE_VECTOR2F_INPUT;
                 xrCreateAction(g_xr.actionSet, &aci, &g_xr.stickAction);
             }
+            // TASK-009: Right grip (squeeze/value) → grab and drag the video panel.
+            // Must be FLOAT — Oculus Touch profile only has /squeeze/value, not /squeeze/click.
+            {
+                XrActionCreateInfo aci = {XR_TYPE_ACTION_CREATE_INFO};
+                snprintf(aci.actionName, XR_MAX_ACTION_NAME_SIZE, "grip");
+                snprintf(aci.localizedActionName,
+                         XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "Grip");
+                aci.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
+                xrCreateAction(g_xr.actionSet, &aci, &g_xr.gripAction);
+            }
+            // TASK-009: Right thumbstick Y → scale panel during grip
+            {
+                XrActionCreateInfo aci = {XR_TYPE_ACTION_CREATE_INFO};
+                snprintf(aci.actionName, XR_MAX_ACTION_NAME_SIZE, "rightstick");
+                snprintf(aci.localizedActionName,
+                         XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "RightStick");
+                aci.actionType = XR_ACTION_TYPE_VECTOR2F_INPUT;
+                xrCreateAction(g_xr.actionSet, &aci, &g_xr.rightStickAction);
+            }
+            // TASK-009: Right aim pose → controller position for drag translation
+            {
+                XrActionCreateInfo aci = {XR_TYPE_ACTION_CREATE_INFO};
+                snprintf(aci.actionName, XR_MAX_ACTION_NAME_SIZE, "rightaim");
+                snprintf(aci.localizedActionName,
+                         XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "RightAim");
+                aci.actionType = XR_ACTION_TYPE_POSE_INPUT;
+                xrCreateAction(g_xr.actionSet, &aci, &g_xr.rightAimAction);
+            }
 
             // Suggest bindings for Oculus Touch interaction profile
             XrPath menuPath, confirmPath, stickPath;
+            XrPath gripPath, rightStickPath, rightAimPath;
             xrStringToPath(g_xr.instance,
-                "/user/hand/left/input/y/click",      &menuPath);
+                "/user/hand/left/input/y/click",               &menuPath);
             xrStringToPath(g_xr.instance,
-                "/user/hand/right/input/a/click",     &confirmPath);
+                "/user/hand/right/input/a/click",              &confirmPath);
             xrStringToPath(g_xr.instance,
-                "/user/hand/left/input/thumbstick", &stickPath);
+                "/user/hand/left/input/thumbstick",            &stickPath);
+            xrStringToPath(g_xr.instance,
+                "/user/hand/right/input/squeeze/value",        &gripPath);  // Oculus Touch: float only
+            xrStringToPath(g_xr.instance,
+                "/user/hand/right/input/thumbstick",           &rightStickPath);
+            xrStringToPath(g_xr.instance,
+                "/user/hand/right/input/aim/pose",             &rightAimPath);
 
             XrActionSuggestedBinding bindings[] = {
-                {g_xr.menuAction,    menuPath},
-                {g_xr.confirmAction, confirmPath},
-                {g_xr.stickAction,   stickPath},
+                {g_xr.menuAction,        menuPath},
+                {g_xr.confirmAction,     confirmPath},
+                {g_xr.stickAction,       stickPath},
+                {g_xr.gripAction,        gripPath},
+                {g_xr.rightStickAction,  rightStickPath},
+                {g_xr.rightAimAction,    rightAimPath},
             };
             XrPath profilePath;
             xrStringToPath(g_xr.instance,
@@ -795,7 +856,7 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
             XrInteractionProfileSuggestedBinding suggested =
                 {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggested.interactionProfile     = profilePath;
-            suggested.countSuggestedBindings = 3;
+            suggested.countSuggestedBindings = 6;
             suggested.suggestedBindings      = bindings;
             if (XR_FAILED(xrSuggestInteractionProfileBindings(g_xr.instance, &suggested))) {
                 LOGW("Input: failed to suggest Oculus Touch bindings");
@@ -809,7 +870,20 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
             if (XR_FAILED(xrAttachSessionActionSets(g_xr.session, &attachInfo))) {
                 LOGW("Input: failed to attach action sets");
             } else {
-                LOGI("Input: action sets attached (Y=menu, A=confirm, leftStick=scroll)");
+                LOGI("Input: action sets attached (Y=menu, A=confirm, leftStick=scroll, rightGrip=drag, rightStick=scale)");
+            }
+
+            // TASK-009: Create action space for right aim pose (used for drag translation).
+            // Must be created after xrAttachSessionActionSets.
+            if (g_xr.rightAimAction != XR_NULL_HANDLE) {
+                XrActionSpaceCreateInfo spaceInfo = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
+                spaceInfo.action = g_xr.rightAimAction;
+                spaceInfo.poseInActionSpace = { {0.f, 0.f, 0.f, 1.f}, {0.f, 0.f, 0.f} };
+                if (XR_FAILED(xrCreateActionSpace(g_xr.session, &spaceInfo, &g_xr.rightAimSpace))) {
+                    LOGW("Input: failed to create right aim space — drag will be disabled");
+                } else {
+                    LOGI("Input: right aim space created");
+                }
             }
         }
     }
@@ -830,13 +904,14 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
     g_xr.u_viewProj = glGetUniformLocation(g_xr.videoProgram, "u_viewProj");
     g_xr.u_halfW    = glGetUniformLocation(g_xr.videoProgram, "u_halfW");
     g_xr.u_halfH    = glGetUniformLocation(g_xr.videoProgram, "u_halfH");
-    g_xr.u_dist     = glGetUniformLocation(g_xr.videoProgram, "u_dist");
-    g_xr.u_yOff     = glGetUniformLocation(g_xr.videoProgram, "u_yOff");
+    g_xr.u_px       = glGetUniformLocation(g_xr.videoProgram, "u_px");
+    g_xr.u_py       = glGetUniformLocation(g_xr.videoProgram, "u_py");
+    g_xr.u_pz       = glGetUniformLocation(g_xr.videoProgram, "u_pz");
     g_xr.u_video    = glGetUniformLocation(g_xr.videoProgram, "u_video");
     g_xr.u_stMat    = glGetUniformLocation(g_xr.videoProgram, "u_stMat");
-    LOGI("Uniforms: viewProj=%d halfW=%d halfH=%d dist=%d yOff=%d video=%d stMat=%d",
-         g_xr.u_viewProj, g_xr.u_halfW, g_xr.u_halfH, g_xr.u_dist,
-         g_xr.u_yOff, g_xr.u_video, g_xr.u_stMat);
+    LOGI("Uniforms: viewProj=%d halfW=%d halfH=%d px=%d py=%d pz=%d video=%d stMat=%d",
+         g_xr.u_viewProj, g_xr.u_halfW, g_xr.u_halfH,
+         g_xr.u_px, g_xr.u_py, g_xr.u_pz, g_xr.u_video, g_xr.u_stMat);
 
     if (!createQuadGeometry(g_xr.quadVAO, g_xr.quadVBO, g_xr.quadEBO,
                             QUAD_VERTS, sizeof(QUAD_VERTS)))
@@ -848,12 +923,14 @@ static bool xrApp_init(JNIEnv* env, jobject activity) {
     g_xr.u_statsViewProj = glGetUniformLocation(g_xr.statsProgram, "u_viewProj");
     g_xr.u_statsHalfW    = glGetUniformLocation(g_xr.statsProgram, "u_halfW");
     g_xr.u_statsHalfH    = glGetUniformLocation(g_xr.statsProgram, "u_halfH");
+    g_xr.u_statsCX       = glGetUniformLocation(g_xr.statsProgram, "u_cx");
     g_xr.u_statsCY       = glGetUniformLocation(g_xr.statsProgram, "u_cy");
     g_xr.u_statsDist     = glGetUniformLocation(g_xr.statsProgram, "u_dist");
     g_xr.u_statsTex      = glGetUniformLocation(g_xr.statsProgram, "u_stats");
-    LOGI("Stats program=%u viewProj=%d halfW=%d halfH=%d cy=%d dist=%d tex=%d",
+    LOGI("Stats program=%u viewProj=%d halfW=%d halfH=%d cx=%d cy=%d dist=%d tex=%d",
          g_xr.statsProgram, g_xr.u_statsViewProj, g_xr.u_statsHalfW,
-         g_xr.u_statsHalfH, g_xr.u_statsCY, g_xr.u_statsDist, g_xr.u_statsTex);
+         g_xr.u_statsHalfH, g_xr.u_statsCX, g_xr.u_statsCY,
+         g_xr.u_statsDist, g_xr.u_statsTex);
 
     if (!createQuadGeometry(g_xr.statsVAO, g_xr.statsVBO, g_xr.statsEBO,
                             STATS_VERTS, sizeof(STATS_VERTS)))
@@ -901,11 +978,14 @@ static bool xrApp_pollEvents() {
             }
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
                 // Fired when the user recentres via the Oculus button.
-                // No action needed: subsequent xrLocateViews will return poses
-                // in the updated LOCAL frame automatically.
+                // Subsequent xrLocateViews return poses in the updated LOCAL frame automatically.
+                // TASK-009: also reset the video panel to its default position so it always
+                // appears centred in front of the user after recentre.
                 auto* e = reinterpret_cast<XrEventDataReferenceSpaceChangePending*>(&event);
-                LOGI("Reference space change pending (type=%d) — recentre applied",
+                LOGI("Reference space change pending (type=%d) — recentre applied, panel reset",
                      (int)e->referenceSpaceType);
+                g_panel = PanelTransform{};
+                g_drag  = DragState{};
                 break;
             }
             case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
@@ -989,6 +1069,74 @@ static bool xrApp_renderFrame() {
                 g_stickYFixed.store((int)(state.currentState.y * 1000.f));
             }
         }
+
+        // ── TASK-009: Right grip (held state via squeeze/value float) ────────
+        // Oculus Touch exposes grip as a float [0..1]; threshold at 0.5 → boolean.
+        bool gripHeld = false;
+        if (g_xr.gripAction != XR_NULL_HANDLE) {
+            XrActionStateFloat   state = {XR_TYPE_ACTION_STATE_FLOAT};
+            XrActionStateGetInfo info  = {XR_TYPE_ACTION_STATE_GET_INFO};
+            info.action = g_xr.gripAction;
+            if (XR_SUCCEEDED(xrGetActionStateFloat(g_xr.session, &info, &state)) &&
+                    state.isActive) {
+                gripHeld = (state.currentState > 0.5f);
+            }
+        }
+
+        // ── TASK-009: Right thumbstick Y (continuous, for scaling) ────────────
+        float rightStickY = 0.f;
+        if (g_xr.rightStickAction != XR_NULL_HANDLE) {
+            XrActionStateVector2f state = {XR_TYPE_ACTION_STATE_VECTOR2F};
+            XrActionStateGetInfo  info  = {XR_TYPE_ACTION_STATE_GET_INFO};
+            info.action = g_xr.rightStickAction;
+            if (XR_SUCCEEDED(xrGetActionStateVector2f(g_xr.session, &info, &state)) &&
+                    state.isActive) {
+                rightStickY = state.currentState.y;
+            }
+        }
+
+        // ── TASK-009: Right aim pose → world-space position for drag ──────────
+        XrVector3f aimPos  = {0.f, 0.f, -1.5f};
+        bool       aimValid = false;
+        if (g_xr.rightAimSpace != XR_NULL_HANDLE) {
+            XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
+            if (XR_SUCCEEDED(xrLocateSpace(g_xr.rightAimSpace, g_xr.appSpace,
+                                           fState.predictedDisplayTime, &loc)) &&
+                (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+                (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+                aimPos  = loc.pose.position;
+                aimValid = true;
+            }
+        }
+
+        // ── TASK-009: Drag state machine ──────────────────────────────────────
+        // Translation: the panel moves 1:1 with the right controller aim point.
+        // Scale: right thumbstick Y scales width while grip is held.
+        if (gripHeld && aimValid) {
+            if (!g_drag.active) {
+                // Grip just pressed — record starting aim position, no movement yet.
+                g_drag.active  = true;
+                g_drag.prevAim = aimPos;
+            } else {
+                // Drag: translate panel by controller delta.
+                g_panel.pose.position.x += aimPos.x - g_drag.prevAim.x;
+                g_panel.pose.position.y += aimPos.y - g_drag.prevAim.y;
+                g_panel.pose.position.z += aimPos.z - g_drag.prevAim.z;
+                g_drag.prevAim = aimPos;
+
+                // Scale: right thumbstick Y — per-frame smooth scaling while held.
+                // Rate: ×1.02 / ×0.98 per frame at 72 Hz → ~1.4× / 0.7× per second.
+                if (rightStickY > 0.5f) {
+                    g_panel.width  = std::clamp(g_panel.width * 1.02f, 0.5f, 4.0f);
+                    g_panel.height = g_panel.width * (9.f / 16.f);
+                } else if (rightStickY < -0.5f) {
+                    g_panel.width  = std::clamp(g_panel.width * 0.98f, 0.5f, 4.0f);
+                    g_panel.height = g_panel.width * (9.f / 16.f);
+                }
+            }
+        } else {
+            g_drag.active = false;
+        }
     }
 
     // ── Locate eye views at predicted display time ────────────────────────────
@@ -1046,10 +1194,12 @@ static bool xrApp_renderFrame() {
         if (hasVideo) {
             glUseProgram(g_xr.videoProgram);
             glUniformMatrix4fv(g_xr.u_viewProj, 1, GL_FALSE, vp.m);
-            glUniform1f(g_xr.u_halfW,  g_xr.screenHalfW);
-            glUniform1f(g_xr.u_halfH,  g_xr.screenHalfH);
-            glUniform1f(g_xr.u_dist,   g_xr.screenDist);
-            glUniform1f(g_xr.u_yOff,   g_xr.screenYOff);
+            // TASK-009: use g_panel for dynamic position and size
+            glUniform1f(g_xr.u_halfW, g_panel.width  * 0.5f);
+            glUniform1f(g_xr.u_halfH, g_panel.height * 0.5f);
+            glUniform1f(g_xr.u_px,    g_panel.pose.position.x);
+            glUniform1f(g_xr.u_py,    g_panel.pose.position.y);
+            glUniform1f(g_xr.u_pz,    g_panel.pose.position.z);  // already negative
 
             // SurfaceTexture affine — row-major in stMat; use transpose=GL_TRUE
             glUniformMatrix3fv(g_xr.u_stMat, 1, GL_TRUE, stMat);
@@ -1075,10 +1225,12 @@ static bool xrApp_renderFrame() {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glUseProgram(g_xr.statsProgram);
             glUniformMatrix4fv(g_xr.u_statsViewProj, 1, GL_FALSE, vp.m);
+            // TASK-009: status overlay follows panel position
             glUniform1f(g_xr.u_statsHalfW, 0.80f);   // 1.6 m wide
             glUniform1f(g_xr.u_statsHalfH, 0.10f);   // 0.2 m tall
-            glUniform1f(g_xr.u_statsCY,    0.0f);    // eye level centre
-            glUniform1f(g_xr.u_statsDist,  1.5f);    // same depth as video
+            glUniform1f(g_xr.u_statsCX,    g_panel.pose.position.x);
+            glUniform1f(g_xr.u_statsCY,    g_panel.pose.position.y);
+            glUniform1f(g_xr.u_statsDist,  -g_panel.pose.position.z);  // positive distance
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, statusTexId);
             glUniform1i(g_xr.u_statsTex, 0);
@@ -1098,14 +1250,22 @@ static bool xrApp_renderFrame() {
                 LOGI("stats overlay: first draw with texId=%u", statsTexId);
                 s_lastLoggedTexId = statsTexId;
             }
+            // TASK-009: stats HUD tracks above the top edge of the video panel.
+            // statsY = panel top + STATS_HALF_H + 0.07 m gap (world-space).
+            // statsDist = panel distance + 0.5 m (slightly farther, same as before at defaults).
+            const float statsY    = g_panel.pose.position.y
+                                  + g_panel.height * 0.5f
+                                  + STATS_HALF_H + 0.07f;
+            const float statsDist = -g_panel.pose.position.z + 0.5f;
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glUseProgram(g_xr.statsProgram);
             glUniformMatrix4fv(g_xr.u_statsViewProj, 1, GL_FALSE, vp.m);
             glUniform1f(g_xr.u_statsHalfW, STATS_HALF_W);
             glUniform1f(g_xr.u_statsHalfH, STATS_HALF_H);
-            glUniform1f(g_xr.u_statsCY,    STATS_CENTER_Y);
-            glUniform1f(g_xr.u_statsDist,  STATS_DIST);
+            glUniform1f(g_xr.u_statsCX,    g_panel.pose.position.x);
+            glUniform1f(g_xr.u_statsCY,    statsY);
+            glUniform1f(g_xr.u_statsDist,  statsDist);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, statsTexId);
             glUniform1i(g_xr.u_statsTex, 0);
@@ -1126,8 +1286,10 @@ static bool xrApp_renderFrame() {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glUseProgram(g_xr.statsProgram);
             glUniformMatrix4fv(g_xr.u_statsViewProj, 1, GL_FALSE, vp.m);
+            // VR connection panel stays fixed at (0, 0, -1.0m) — closer than video.
             glUniform1f(g_xr.u_statsHalfW, 0.40f);   // 0.8 m wide
             glUniform1f(g_xr.u_statsHalfH, 0.125f);  // 0.25 m tall (512:160 ≈ 3.2:1)
+            glUniform1f(g_xr.u_statsCX,    0.0f);    // centred horizontally
             glUniform1f(g_xr.u_statsCY,    0.0f);    // eye level (LOCAL Y=0)
             glUniform1f(g_xr.u_statsDist,  1.0f);    // 1.0 m (closer than video at 1.5m)
             glActiveTexture(GL_TEXTURE0);
@@ -1192,11 +1354,16 @@ static void xrApp_destroy(JNIEnv* env) {
     g_panelTexId.store(0);
     g_statusTexId.store(0);
 
-    // Destroy input actions (action set must be destroyed last)
-    if (g_xr.stickAction   != XR_NULL_HANDLE) { xrDestroyAction(g_xr.stickAction);    g_xr.stickAction   = XR_NULL_HANDLE; }
-    if (g_xr.confirmAction != XR_NULL_HANDLE) { xrDestroyAction(g_xr.confirmAction);  g_xr.confirmAction = XR_NULL_HANDLE; }
-    if (g_xr.menuAction    != XR_NULL_HANDLE) { xrDestroyAction(g_xr.menuAction);     g_xr.menuAction    = XR_NULL_HANDLE; }
-    if (g_xr.actionSet     != XR_NULL_HANDLE) { xrDestroyActionSet(g_xr.actionSet);   g_xr.actionSet     = XR_NULL_HANDLE; }
+    // Destroy input actions (action set must be destroyed last; spaces before actions)
+    // TASK-009: new actions/spaces
+    if (g_xr.rightAimSpace    != XR_NULL_HANDLE) { xrDestroySpace(g_xr.rightAimSpace);        g_xr.rightAimSpace    = XR_NULL_HANDLE; }
+    if (g_xr.rightAimAction   != XR_NULL_HANDLE) { xrDestroyAction(g_xr.rightAimAction);      g_xr.rightAimAction   = XR_NULL_HANDLE; }
+    if (g_xr.rightStickAction != XR_NULL_HANDLE) { xrDestroyAction(g_xr.rightStickAction);    g_xr.rightStickAction = XR_NULL_HANDLE; }
+    if (g_xr.gripAction       != XR_NULL_HANDLE) { xrDestroyAction(g_xr.gripAction);          g_xr.gripAction       = XR_NULL_HANDLE; }
+    if (g_xr.stickAction      != XR_NULL_HANDLE) { xrDestroyAction(g_xr.stickAction);         g_xr.stickAction      = XR_NULL_HANDLE; }
+    if (g_xr.confirmAction    != XR_NULL_HANDLE) { xrDestroyAction(g_xr.confirmAction);       g_xr.confirmAction    = XR_NULL_HANDLE; }
+    if (g_xr.menuAction       != XR_NULL_HANDLE) { xrDestroyAction(g_xr.menuAction);          g_xr.menuAction       = XR_NULL_HANDLE; }
+    if (g_xr.actionSet        != XR_NULL_HANDLE) { xrDestroyActionSet(g_xr.actionSet);        g_xr.actionSet        = XR_NULL_HANDLE; }
 
     for (int eye = 0; eye < 2; ++eye) destroySwapchain(g_xr.swapchains[eye]);
 

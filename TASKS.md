@@ -831,7 +831,7 @@ MediaCodec → AHardwareBuffer → VkImage (через VK_EXT_external_memory_ho
 
 ## TASK-009 — Масштабирование и перемещение окна вьювера в стиле Quest UI
 
-**Статус:** `todo`  
+**Статус:** `done`  
 **Приоритет:** средний  
 **Зависимости:** TASK-005
 

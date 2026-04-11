@@ -174,6 +174,7 @@ https://localhost:8080/streamer.html
 | TASK-004 | ✅ | Zero-copy OES-текстура (EglVideoSink → video_decoder.cpp) |
 | TASK-005 | ✅ | OpenXR стерео-рендеринг (xr_renderer.cpp + XrRenderThread.kt) |
 | TASK-006 | ✅ | FPVDataChannel E2E-статистика в VR HUD (world-space quad над видео, Bitmap→GL_TEXTURE_2D, recentering) |
+| TASK-009 | ✅ | Grab & scale видео-окна: правый grip перемещает, правый стик Y масштабирует, recentre сбрасывает |
 
 ### Сборка и запуск
 
@@ -210,6 +211,18 @@ adb logcat -s FPVQuest WebRTCEngine SignalingClient FPVDataChannel xr_renderer v
 4. Надень Quest — видео появится в стерео (OpenXR VR-режим)
 
 > Если сервер запущен с `TLS=1`, вводи `wss://` — приложение принимает самоподписанный сертификат автоматически.
+
+### Управление видео-окном (TASK-009)
+
+| Действие | Жест |
+|----------|------|
+| Переместить окно | Правый grip — потянуть |
+| Увеличить / уменьшить | Правый grip удержать + правый стик Y вверх / вниз |
+| Сбросить положение | Кнопка Oculus (recentre) |
+| Открыть настройки IP | Кнопка Y (левый контроллер) |
+| Подтвердить IP | Кнопка A (правый контроллер) |
+
+Ширина окна: 0.5–4.0 м; соотношение сторон 16:9 сохраняется. Stats HUD следует за окном автоматически.
 
 ---
 

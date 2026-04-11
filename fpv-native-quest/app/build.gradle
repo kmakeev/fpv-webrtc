@@ -11,10 +11,10 @@ android {
         applicationId "com.fpv.quest"
         // Quest 2 runs Android 10 (API 29) minimum
         minSdk 29
-        // Target Android 12L (API 32) — last version with full Quest 2 support
-        targetSdk 32
+        // Target Android 13 (API 33) — required by Google Play lint; Quest 2 runs API 29 baseline
+        targetSdk 33
         versionCode 1
-        versionName "0.1.0"
+        versionName "0.1.0-alpha"
 
         // Quest 2 is ARM64 only — skip x86/x86_64/armeabi-v7a
         ndk {
