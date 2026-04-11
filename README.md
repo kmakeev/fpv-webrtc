@@ -201,7 +201,8 @@ adb shell am start -n com.fpv.quest/.MainActivity
 adb logcat -s FPVQuest WebRTCEngine SignalingClient FPVDataChannel xr_renderer video_decoder
 ```
 
-> Подробная инструкция по установке окружения: [`docs/native-android-setup.md`](docs/native-android-setup.md)
+> Подробная инструкция по установке окружения: [`docs/native-android-setup.md`](docs/native-android-setup.md)  
+> Установка APK на Quest (ADB / MQDH / SideQuest): [`docs/sideload-install.md`](docs/sideload-install.md)
 
 ### Подключение
 
