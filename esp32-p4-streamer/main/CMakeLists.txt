@@ -16,5 +16,12 @@ idf_component_register(
         json
         freertos
         log
+        esp_timer
+        esp_driver_cam
+        esp_driver_isp
+        esp_driver_i2c
+        esp_hw_support
+        espressif__esp_cam_sensor
+        espressif__esp_h264
         libpeer
 )

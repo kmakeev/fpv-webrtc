@@ -287,12 +287,12 @@ echo 'target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-incompatible-pointer-
 
 | Файл | Назначение | Статус |
 |------|-----------|--------|
-| `main.c` | Инициализация, оркестрация | ✅ PROMPT-01 (skeleton) |
+| `main.c` | Инициализация, оркестрация | ✅ PROMPT-06 (полная интеграция) |
 | `config.h` | Константы | ✅ PROMPT-01 |
 | `signaling.c/h` | WiFi AP + HTTP + WebSocket | ✅ PROMPT-02 |
 | `webrtc_streamer.c/h` | WebRTC (libpeer) | ✅ PROMPT-03 |
-| `camera.c/h` | OV5647 + H.264 HW encoder | 🔲 PROMPT-04 |
-| `datachannel.c/h` | DataChannel ping/pong + ts | 🔲 PROMPT-05 |
+| `camera.c/h` | OV5647 + H.264 HW encoder | ✅ PROMPT-04 |
+| `datachannel.c/h` | DataChannel ping/pong + ts | ✅ PROMPT-05 |
 
 ### Особенности AP-режима
 
@@ -301,9 +301,17 @@ echo 'target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-incompatible-pointer-
 - WebSocket регистрируется на двух путях: `/` (браузерный viewer) и `/ws` (нативное приложение Quest).
 - `signaling_send_json` использует `httpd_queue_work` для thread-safe отправки из любого FreeRTOS-таска.
 - `httpd_ws_get_fd_info(hd, fd)` возвращает `httpd_ws_client_info_t` напрямую (не через указатель); разрыв = `!= HTTPD_WS_CLIENT_WEBSOCKET`.
-- OV5647 подключена через MIPI CSI (не DVP) — API `esp_camera` отличается от ESP32-S3.
+- OV5647 подключена через MIPI CSI (не DVP). Используется нативный IDF-стек: `esp_driver_cam` (CSI-контроллер) + `esp_driver_isp` (RAW8→YUV420) + `espressif/esp_cam_sensor` (авто-детект OV5647 через SCCB/I2C). `espressif/esp32-camera` для ESP32-P4 **не используется** — не имеет скомпилированных символов для P4.
+- **Пинаут SCCB (I2C) на ESP32-P4-Function-EV-Board**: SDA=GPIO7, SCL=GPIO8. MIPI PHY LDO: канал 3, 2500 мВ — инициализируется через `esp_ldo_acquire_channel` перед CSI.
+- **CSI конфигурация**: 2 data lanes, 200 Mbps/lane, input=RAW8, output=YUV420 (ISP конвертирует). ISP: `ISP_INPUT_DATA_SOURCE_CSI`, `ISP_COLOR_RAW8` → `ISP_COLOR_YUV420`, clk=80 MHz.
+- **Выбор формата сенсора**: `esp_cam_sensor_query_format` + поиск подстроки "1280x720" в имени формата. `CONFIG_CAMERA_OV5647=y` в sdkconfig.defaults активирует OV5647 driver в компоненте.
+- **Double-buffer захват**: 2 PSRAM буфера (по 1.32 МБ каждый, 64-байт alignment), кольцевой индекс `g_dma_next`. Callback `on_get_new_trans` (IRAM) предоставляет следующий буфер; `on_trans_finished` (IRAM) отправляет указатель в `xQueueOverwriteFromISR`. `bk_buffer_dis=true` — без внутреннего backup buffer.
 - H.264 кодируется аппаратным VEU (`esp_h264_enc_hw_new`): битрейт 2 Мбит/с, GOP 30.
 - `encode_ms` в DataChannel `ts`-сообщениях — реальное время кодирования (в отличие от `streamer.html`, где ≈ 0).
+- **HW H.264 формат**: ESP32-P4 rev 1.x (`CONFIG_ESP32P4_REV_MIN_FULL=100 < 300`) поддерживает ТОЛЬКО `ESP_H264_RAW_FMT_O_UYY_E_VYY`. ISP выдаёт I420 (YUV420 planar) — `camera.c` конвертирует в O_UYY_E_VYY перед кодированием (`i420_to_ouyy_evyy`). Обоим форматам нужно 1.5 байт/пиксель; конвертация out-of-place в отдельный PSRAM-буфер.
+- **DataChannel ts-таймер**: создаётся в `datachannel_on_open()`, удаляется в `datachannel_on_close()`. `g_encode_ms` защищён `portMUX_TYPE` spinlock (camera_task на core 1, таймер на core 0).
+- **Reconnect flow**: `on_viewer_ready` (signaling callback) вызывает `webrtc_reset()` → `webrtc_init()` при каждом новом подключении viewer'а. Это удаляет предыдущий `peer_loop_task`, уничтожает PeerConnection, вызывает `peer_deinit()` + `peer_init()`, создаёт новый PC. Camera task продолжает работать — фреймы отбрасываются внутри `webrtc_push_video_frame` пока `PEER_CONNECTION_COMPLETED` не установлен снова. DataChannel `ts`-таймер останавливается в `on_webrtc_disconnected` / `on_peer_disconnected` до следующего `on_webrtc_connected`.
+- **peer_loop_task** (core 0, priority 6) + **camera_task** (core 1, priority 5): разделение по ядрам обязательно — WebRTC stack (ICE/DTLS/SCTP/RTP) и H.264 кодирование не мешают друг другу.
 
 ## Ключевые технические ограничения
 

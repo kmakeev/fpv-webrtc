@@ -1,5 +1,5 @@
 #pragma once
-// TODO: implemented in PROMPT-05
+// PROMPT-05: DataChannel ping/pong clock sync + ts timestamp messages
 
 #include <stdint.h>
 #include <stddef.h>

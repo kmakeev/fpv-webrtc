@@ -1,7 +1,7 @@
 ## IDF Component Manager Manifest File
 dependencies:
   idf: ">=5.4"
-  espressif/esp32-camera: "*"
+  espressif/esp_cam_sensor: "^0.6.1"
   espressif/esp_h264: "*"
   sepfy/libpeer: "*"
   espressif/esp_hosted: "2.12.3"

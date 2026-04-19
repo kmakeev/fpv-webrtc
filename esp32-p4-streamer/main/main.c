@@ -20,31 +20,28 @@ static const char *TAG = "main";
 static void on_webrtc_connected(void)
 {
     ESP_LOGI(TAG, "WebRTC connected — streaming");
-    // TODO PROMPT-05: datachannel_on_open();
+    datachannel_on_open();
 }
 
 static void on_webrtc_disconnected(void)
 {
     ESP_LOGI(TAG, "WebRTC disconnected");
-    // TODO PROMPT-05: datachannel_on_close();
+    datachannel_on_close();
 }
 
 static void on_datachannel_msg(const char *msg, size_t len)
 {
-    // TODO PROMPT-05: datachannel_on_message(msg, len);
-    (void)msg;
-    (void)len;
+    datachannel_on_message(msg, len);
 }
 
 // ──────────────────────────────────────────────
-// Camera callback (PROMPT-04)
+// Camera callback
 // ──────────────────────────────────────────────
 
 static void on_camera_frame(const uint8_t *data, size_t len,
                             uint64_t pts_ms, uint32_t encode_ms)
 {
-    // TODO PROMPT-05: datachannel_update_encode_ms(encode_ms);
-    (void)encode_ms;
+    datachannel_update_encode_ms(encode_ms);
     webrtc_push_video_frame(data, len, pts_ms);
 }
 
@@ -62,7 +59,7 @@ static void on_viewer_ready(void)
 static void on_peer_disconnected(void)
 {
     ESP_LOGI(TAG, "Viewer disconnected, resetting WebRTC");
-    // TODO PROMPT-05: datachannel_on_close();
+    datachannel_on_close();
     webrtc_reset();
 }
 
@@ -85,14 +82,14 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // PROMPT-03: WebRTC (init before signaling — will be called from on_viewer_ready)
+    // WebRTC (init before signaling — will be called from on_viewer_ready)
     webrtc_set_callbacks(on_webrtc_connected, on_webrtc_disconnected, on_datachannel_msg);
     webrtc_init();
 
-    // TODO PROMPT-04: camera_init(on_camera_frame);
-    (void)on_camera_frame; // suppress unused warning until PROMPT-04
+    // Camera + H.264 encoder (WebRTC already ready to accept frames)
+    ESP_ERROR_CHECK(camera_init(on_camera_frame));
 
-    // PROMPT-02: WiFi AP + HTTP/WebSocket signaling server
+    // WiFi AP + HTTP/WebSocket signaling server
     signaling_set_callbacks(on_viewer_ready,
                             webrtc_set_answer,
                             webrtc_add_ice_candidate,

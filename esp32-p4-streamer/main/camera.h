@@ -1,5 +1,5 @@
 #pragma once
-// TODO: implemented in PROMPT-04
+// PROMPT-04: Camera OV5647 + hardware H.264 encoder (VEU)
 
 #include <stdint.h>
 #include <stddef.h>
