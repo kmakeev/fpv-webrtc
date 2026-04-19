@@ -183,6 +183,128 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | `webxr-renderer.js` | `xr_renderer.cpp` + `XrRenderThread.kt` | ✅ TASK-005 |
 | `stats.js` | inline в `MainActivity.kt` + `xr_renderer.cpp` (stats HUD overlay) | ✅ TASK-006 |
 
+## ESP32-P4 прошивка (esp32-p4-streamer/)
+
+Автономный FPV-стример на базе ESP32-P4-Function-EV-Board с камерой OV5647. Заменяет `streamer.html` и Node.js-сервер: ESP32 сама является и стримером, и сигналинг-сервером.
+
+**Архитектура:** ESP32 поднимает WiFi AP "FPV-Drone" (192.168.4.1), запускает HTTP+WebSocket сервер на порту 8080, раздаёт `public/` через SPIFFS и выступает WebRTC-стримером. Ноутбук нужен только для сборки и прошивки.
+
+### Структура проекта
+
+```
+esp32-p4-streamer/
+├── CMakeLists.txt          # top-level cmake; SPIFFS из ../public/
+├── sdkconfig.defaults      # ESP32-P4: SPIRAM OCT, WiFi AMPDU, HTTPD WS, FreeRTOS 1000Hz
+├── partitions.csv          # NVS(24KB) + PHY(4KB) + factory(4MB) + OTA(4MB) + SPIFFS(2MB)
+├── idf_component.yml       # esp_camera + esp_h264 + libpeer
+└── main/
+    ├── CMakeLists.txt      # idf_component_register
+    ├── config.h            # константы: SSID/PASS/PORT/WS_PATH/CAM params
+    ├── main.c              # app_main: NVS → netif → webrtc → camera → signaling
+    ├── signaling.c/h       # WiFi AP + HTTP static + WebSocket сигналинг (PROMPT-02)
+    ├── webrtc_streamer.c/h # libpeer PeerConnection + DataChannel (PROMPT-03)
+    ├── camera.c/h          # OV5647 MIPI CSI + esp_h264 HW encoder (PROMPT-04)
+    └── datachannel.c/h     # ping/pong clock sync + ts timestamps (PROMPT-05)
+```
+
+### Требования к окружению
+
+| Компонент | Версия | Примечание |
+|-----------|--------|-----------|
+| ESP-IDF | **≥ 5.4** | 5.3 не поддерживает ESP32-P4 ревизию v1.x (production) |
+| Таргет | esp32p4 | |
+
+### Команды сборки
+
+```bash
+cd esp32-p4-streamer
+
+# Первая сборка (загружает managed_components, ~3–5 мин)
+idf.py set-target esp32p4
+idf.py build
+
+# Прошивка + SPIFFS (FLASH_IN_PROJECT — прошивается автоматически)
+idf.py -p /dev/cu.usbmodem* flash monitor
+
+# Только логи (без перепрошивки)
+idf.py -p /dev/cu.usbmodem* monitor
+
+# Ctrl+] — выход из монитора
+```
+
+### Ключевые настройки sdkconfig.defaults
+
+| Ключ | Значение | Причина |
+|------|----------|---------|
+| `CONFIG_ESPTOOLPY_FLASHSIZE` | `"16MB"` | ESP32-P4-Function-EV-Board имеет 16MB flash |
+| `CONFIG_PARTITION_TABLE_CUSTOM` | `y` | Кастомная таблица с SPIFFS(2MB) и OTA(4MB) |
+| `CONFIG_MBEDTLS_SSL_PROTO_DTLS` | `y` | Нужен libpeer (DTLS для WebRTC) |
+| `CONFIG_MBEDTLS_SSL_DTLS_SRTP` | `y` | Нужен libpeer (SRTP профили) |
+| `CONFIG_SPIRAM_MODE_OCT` | `y` | ESP32-P4 PSRAM в Octal-режиме |
+| `CONFIG_ESP_WIFI_REMOTE_ENABLED` | `y` | ESP32-P4 WiFi через `esp_wifi_remote` → ESP32-C6 coprocessor по SDIO |
+| `CONFIG_ESP_HOSTED_ENABLED` | `y` | esp-hosted-mcu v2.12.3 host driver (соответствует прошивке C6) |
+| `CONFIG_ESP_HOSTED_P4_DEV_BOARD_FUNC_BOARD` | `y` | Preset GPIO SDIO-пинов для ESP32-P4-Function-EV-Board (CLK=18, CMD=19, D0–D3=14–17, RST=54) |
+
+### Прошивка ESP32-C6 (однократно, при смене платы)
+
+C6 на ESP32-P4-Function-EV-Board идёт с factory firmware esp-hosted v0.0.6, несовместимой с IDF 5.4. Нужно обновить до v2.12.3 через OTA:
+
+```bash
+# 1. Собрать slave firmware для C6
+cd ~/esp/esp-hosted-mcu/slave
+idf.py set-target esp32c6 && idf.py build
+
+# 2. Скопировать бинарник в OTA-пример
+cp build/network_adapter.bin \
+   ~/esp/esp-hosted-mcu/examples/host_performs_slave_ota/components/ota_littlefs/slave_fw_bin/
+
+# 3. Прошить OTA-пример на P4 (он прошьёт C6 через SDIO)
+cd ~/esp/esp-hosted-mcu/examples/host_performs_slave_ota
+rm -f sdkconfig
+idf.py set-target esp32p4 && idf.py build
+idf.py -p /dev/cu.usbmodem* flash monitor
+# Успех: "Slave firmware version: 2.12.3" + "Versions compatible - OTA not required"
+```
+
+### Исправления в managed_components
+
+После скачивания компонентов (первый `idf.py build`) требуются однократные патчи:
+
+```bash
+# sepfy/libpeer использует cmake_minimum_required(VERSION 3.1) — несовместимо с CMake ≥ 3.28
+sed -i '' 's/cmake_minimum_required(VERSION 3.1)/cmake_minimum_required(VERSION 3.5)/' \
+    managed_components/sepfy__libpeer/CMakeLists.txt
+
+# sepfy/srtp: GCC 14 делает unsigned int* vs uint32_t* hard error на RISC-V
+# Добавить в конец managed_components/sepfy__srtp/CMakeLists.txt:
+echo 'target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-incompatible-pointer-types)' \
+    >> managed_components/sepfy__srtp/CMakeLists.txt
+```
+
+> Если `managed_components/` удалить и скачать заново — патчи нужно повторить.
+
+### Статус реализации
+
+| Файл | Назначение | Статус |
+|------|-----------|--------|
+| `main.c` | Инициализация, оркестрация | ✅ PROMPT-01 (skeleton) |
+| `config.h` | Константы | ✅ PROMPT-01 |
+| `signaling.c/h` | WiFi AP + HTTP + WebSocket | ✅ PROMPT-02 |
+| `webrtc_streamer.c/h` | WebRTC (libpeer) | ✅ PROMPT-03 |
+| `camera.c/h` | OV5647 + H.264 HW encoder | 🔲 PROMPT-04 |
+| `datachannel.c/h` | DataChannel ping/pong + ts | 🔲 PROMPT-05 |
+
+### Особенности AP-режима
+
+- **WiFi архитектура**: ESP32-P4 (без встроенного WiFi) использует ESP32-C6 как WiFi-сопроцессор по SDIO. Стек: `esp_wifi_remote` (компонент) оборачивает стандартный `esp_wifi` API и транслирует вызовы через `esp_hosted` (компонент, host-side driver v2.12.3) → SDIO → C6 firmware (esp-hosted-mcu v2.12.3). C6 выполняет реальную WiFi-операцию и возвращает результат. Важно: встроенный IDF-драйвер `CONFIG_ESP_HOST_WIFI_ENABLED` несовместим с C6 firmware v2.12.3 — нужны именно компоненты `espressif/esp_hosted` + `espressif/esp_wifi_remote`. `esp_phy` для ESP32-P4 — пустой стаб.
+- STUN-сервер не нужен: ESP32 и Quest 2 в одной подсети (192.168.4.0/24), ICE через host candidates.
+- WebSocket регистрируется на двух путях: `/` (браузерный viewer) и `/ws` (нативное приложение Quest).
+- `signaling_send_json` использует `httpd_queue_work` для thread-safe отправки из любого FreeRTOS-таска.
+- `httpd_ws_get_fd_info(hd, fd)` возвращает `httpd_ws_client_info_t` напрямую (не через указатель); разрыв = `!= HTTPD_WS_CLIENT_WEBSOCKET`.
+- OV5647 подключена через MIPI CSI (не DVP) — API `esp_camera` отличается от ESP32-S3.
+- H.264 кодируется аппаратным VEU (`esp_h264_enc_hw_new`): битрейт 2 Мбит/с, GOP 30.
+- `encode_ms` в DataChannel `ts`-сообщениях — реальное время кодирования (в отличие от `streamer.html`, где ≈ 0).
+
 ## Ключевые технические ограничения
 
 - WebXR требует HTTPS (`TLS=1`), кроме случая `localhost`.
@@ -209,4 +331,5 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - Центрирование и reference space: используется `XR_REFERENCE_SPACE_TYPE_LOCAL` (Y=0 = уровень глаз пользователя в момент последнего recentre). При нажатии кнопки Oculus runtime генерирует `XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING`; последующие `xrLocateViews` автоматически возвращают позиции в обновлённом LOCAL-фрейме — контент возвращается по центру без каких-либо действий на стороне приложения. `XR_REFERENCE_SPACE_TYPE_STAGE` (origin на уровне пола) не используется: видео на Y=0 оказывалось бы на уровне пола.
 - **TASK-007 QoS**: WebRTC field trials (в `WebRTCEngine.kt`): `SendSideBwe-WithOverhead/Enabled/` (BWE учитывает заголовки), `Video-MinPlayoutDelay/min_ms:0/` (jitter-буфер без минимальной задержки), `ReducedRtcpPollingInterval/Enabled/` (RTCP обновляется чаще → RTT-оценки точнее). WiFi High Performance Lock (`WIFI_MODE_FULL_HIGH_PERF`, требует разрешений `CHANGE_WIFI_STATE` + `WAKE_LOCK`) удерживается с момента `startConnection()` до `onStop()` — устраняет latency spikes от WiFi power-save (10–50 мс). CPU/GPU BOOST через `XR_EXT_performance_settings` (`xrPerfSettingsSetPerformanceLevelEXT`): вызывается после `xrCreateSession` для обоих доменов (`CPU_EXT`, `GPU_EXT`); расширение проверяется как опциональное (`xrEnumerateInstanceExtensionProperties`) перед включением в `xrCreateInstance`. Тепловые throttling-события логируются через `XR_TYPE_EVENT_DATA_PERF_SETTINGS_EXT`.
 - **TASK-009 grab & scale**: видео-квад управляется структурой `g_panel` (`PanelTransform{XrPosef, width, height}`) вместо захардкоженных констант. Вся логика работает в C++ внутри `xrApp_renderFrame()`. Три новых `XrAction` в том же `XrActionSet "fpv"`: `gripAction` (right squeeze/click, boolean) → drag; `rightStickAction` (right thumbstick, vector2f) → scale Y-осью во время grip; `rightAimAction` (right aim pose) + `rightAimSpace` → позиция контроллера в LOCAL-пространстве. Drag: панель перемещается 1:1 с дельтой aim-позиции (`g_drag.prevAim`). Scale: right stick Y > 0.5 → width × 1.02, < −0.5 → width × 0.98, ограничение [0.5, 4.0] м, высота пересчитывается как 9/16 × width. Stats HUD следует за панелью: `statsY = panel.y + panel.height/2 + STATS_HALF_H + 0.07`, `statsDist = −panel.z + 0.5`. Status overlay и stats шейдер получили новый uniform `u_cx` (horizontal centre). Recentre (Oculus button) → `g_panel = PanelTransform{}` (сброс в (0, 0, −1.5 м), 2×1.125 м).
+- **libpeer `onicecandidate` (ESP32-P4)**: callback `on_ice_candidate_cb(char *sdp, void *userdata)` вызывается libpeer с **полным SDP offer** (включая встроенные `a=candidate` host-кандидаты) — это не trickle ICE. Из callback вызывается `signaling_send_offer(sdp)`, а НЕ `signaling_send_ice()`. DataChannel "fpv" создаётся через `peer_connection_create_datachannel()` только в `on_state_change_cb` при `PEER_CONNECTION_COMPLETED` (не CONNECTED). `peer_connection_loop(pc)` требует выделенного FreeRTOS task с тиком 1 мс (stack 8192, priority 6, core 0) — без него ICE, DTLS и SCTP не обрабатываются. Состояние `PEER_CONNECTION_COMPLETED` (не CONNECTED) означает готовность к отправке видео и DataChannel-сообщений.
 - **Процесс-lifecycle после XR-сессии**: Quest OS убивает Activity, запущенную в «тёплом» процессе (процесс уже имел XR-сессию) — сессия застревает на `XR_SESSION_STATE_SYNCHRONIZED`, никогда не достигает `FOCUSED`, и через ~300 мс приходит `Force finishing activity`. Свежий процесс (Zygote fork) всегда работает. Решение: `onDestroy()` вызывает `Process.killProcess(myPid())` — следующий запуск всегда получает чистый процесс. Дополнительно: если OS убивает процесс до `onDestroy()` (за ~29 мс), `onPause()` ставит `AlarmManager`-alarm на 2 с (живёт в system_server, выживает после смерти процесса); условие срабатывания — `isFinishing && xrThread != null && !nativeWasSessionFocused()`. Флаг `sessionEverFocused` в `XrApp` (C++) сбрасывается в `xrApp_destroy()` чтобы не наследовать значение `true` от предыдущей сессии при переиспользовании процесса.

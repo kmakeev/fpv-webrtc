@@ -1,0 +1,8 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf: ">=5.4"
+  espressif/esp32-camera: "*"
+  espressif/esp_h264: "*"
+  sepfy/libpeer: "*"
+  espressif/esp_hosted: "2.12.3"
+  espressif/esp_wifi_remote: "*"
