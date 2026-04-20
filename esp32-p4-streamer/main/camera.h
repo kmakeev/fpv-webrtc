@@ -15,3 +15,7 @@ typedef void (*camera_frame_cb_t)(const uint8_t *data, size_t len,
 
 esp_err_t camera_init(camera_frame_cb_t frame_cb);
 void      camera_deinit(void);
+
+// Request that the next encoded frame be an IDR (keyframe).
+// Thread-safe; may be called from any task (e.g. on WebRTC connect or PLI).
+void      camera_request_idr(void);

@@ -21,6 +21,9 @@ static void on_webrtc_connected(void)
 {
     ESP_LOGI(TAG, "WebRTC connected — streaming");
     datachannel_on_open();
+    // Camera may be mid-GOP; force an IDR so the Quest decoder can start immediately
+    // without waiting up to 6 s for the next natural keyframe.
+    camera_request_idr();
 }
 
 static void on_webrtc_disconnected(void)
@@ -87,7 +90,13 @@ void app_main(void)
     webrtc_init();
 
     // Camera + H.264 encoder (WebRTC already ready to accept frames)
-    ESP_ERROR_CHECK(camera_init(on_camera_frame));
+    // Use ESP_ERROR_CHECK_WITHOUT_ABORT so that I2C scan diagnostic stays visible in log
+    esp_err_t cam_ret = camera_init(on_camera_frame);
+    if (cam_ret != ESP_OK) {
+        ESP_LOGE(TAG, "camera_init failed: %s — check I2C scan output above", esp_err_to_name(cam_ret));
+        // Halt instead of reboot so the log stays on screen
+        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
     // WiFi AP + HTTP/WebSocket signaling server
     signaling_set_callbacks(on_viewer_ready,

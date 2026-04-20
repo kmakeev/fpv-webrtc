@@ -5,7 +5,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/timers.h"
+#include "freertos/task.h"
 #include "freertos/portmacro.h"
 #include "cJSON.h"
 #include <string.h>
@@ -18,10 +18,14 @@ static const char *TAG = "datachannel";
 // State
 // ──────────────────────────────────────────────
 
-static TimerHandle_t     g_ts_timer  = NULL;
+// Dedicated task for sending ts messages every 1 s while DataChannel is open.
+// Uses a task (not a FreeRTOS timer) so it has its own stack — cJSON printing
+// internally calls snprintf/_svfprintf_r which needs ~1 KB stack, far more than
+// the 2 KB "Tmr Svc" default allows.
+static TaskHandle_t      g_ts_task   = NULL;
 
-// g_encode_ms is updated from camera_task (core 1) and read from the timer
-// callback (timer task / core 0). A portMUX_TYPE spinlock protects it.
+// g_encode_ms is updated from camera_task (core 1) and read from the ts task
+// (core 0). A portMUX_TYPE spinlock protects it.
 static portMUX_TYPE      g_enc_mux   = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t g_encode_ms = 0;
 
@@ -40,24 +44,36 @@ static void dc_send(cJSON *msg)
 }
 
 // ──────────────────────────────────────────────
-// ts-timer callback: fires every 1000 ms while DataChannel is open
+// ts task: sends one ts message per second.
+// Exits when notified (via datachannel_on_close) or if 1-s delay is interrupted.
 // ──────────────────────────────────────────────
 
-static void ts_timer_cb(TimerHandle_t xTimer)
+static void dc_ts_task(void *arg)
 {
-    portENTER_CRITICAL(&g_enc_mux);
-    uint32_t enc = g_encode_ms;
-    portEXIT_CRITICAL(&g_enc_mux);
+    while (1) {
+        // Sleep 1 s; wake early if notified to stop
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) != 0) {
+            break;  // datachannel_on_close() sent the stop signal
+        }
 
-    cJSON *msg = cJSON_CreateObject();
-    if (!msg) return;
+        portENTER_CRITICAL(&g_enc_mux);
+        uint32_t enc = g_encode_ms;
+        portEXIT_CRITICAL(&g_enc_mux);
 
-    cJSON_AddStringToObject(msg, "type",    "ts");
-    cJSON_AddNumberToObject(msg, "capture", (double)(esp_timer_get_time() / 1000));
-    cJSON_AddNumberToObject(msg, "encode",  (double)enc);
+        cJSON *msg = cJSON_CreateObject();
+        if (!msg) continue;
 
-    ESP_LOGD(TAG, "Sent ts: capture=... encode=%"PRIu32"ms", enc);
-    dc_send(msg);
+        // capture = time now (ms since boot).
+        // encode  = capture + g_encode_ms so that encode - capture = encode duration.
+        double now_ms = (double)(esp_timer_get_time() / 1000);
+        cJSON_AddStringToObject(msg, "type",    "ts");
+        cJSON_AddNumberToObject(msg, "capture", now_ms);
+        cJSON_AddNumberToObject(msg, "encode",  now_ms + (double)enc);
+        dc_send(msg);
+    }
+
+    g_ts_task = NULL;
+    vTaskDelete(NULL);
 }
 
 // ──────────────────────────────────────────────
@@ -68,18 +84,11 @@ void datachannel_on_open(void)
 {
     ESP_LOGI(TAG, "Channel open");
 
-    // Create (or restart) the 1-second ts timer
-    if (g_ts_timer == NULL) {
-        g_ts_timer = xTimerCreate("dc_ts",
-                                  pdMS_TO_TICKS(1000),
-                                  pdTRUE,       // auto-reload
-                                  NULL,
-                                  ts_timer_cb);
-    }
-    if (g_ts_timer) {
-        xTimerStart(g_ts_timer, 0);
-    } else {
-        ESP_LOGE(TAG, "Failed to create ts timer");
+    if (g_ts_task == NULL) {
+        xTaskCreatePinnedToCore(dc_ts_task, "dc_ts", 4096, NULL, 4, &g_ts_task, 0);
+        if (!g_ts_task) {
+            ESP_LOGE(TAG, "Failed to create dc_ts task");
+        }
     }
 }
 
@@ -107,8 +116,6 @@ void datachannel_on_message(const char *json_str, size_t len)
         double t0 = t0_item->valuedouble;
         double t1 = (double)(esp_timer_get_time() / 1000);
 
-        ESP_LOGD(TAG, "ping id=%d t0=%.0f → pong t1=%.0f", id, t0, t1);
-
         cJSON *pong = cJSON_CreateObject();
         if (pong) {
             cJSON_AddStringToObject(pong, "type", "pong");
@@ -126,10 +133,9 @@ void datachannel_on_message(const char *json_str, size_t len)
 void datachannel_on_close(void)
 {
     ESP_LOGI(TAG, "Channel closed");
-    if (g_ts_timer) {
-        xTimerStop(g_ts_timer, 0);
-        xTimerDelete(g_ts_timer, 0);
-        g_ts_timer = NULL;
+    if (g_ts_task) {
+        xTaskNotifyGive(g_ts_task);  // wake dc_ts_task to exit
+        // Task deletes itself; g_ts_task cleared by the task itself
     }
 }
 

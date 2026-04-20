@@ -1,12 +1,15 @@
 // PROMPT-03: WebRTC стек через libpeer
 #include "webrtc_streamer.h"
 #include "signaling.h"
+#include "camera.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "peer.h"
 #include "peer_connection.h"
 #include <string.h>
+#include <inttypes.h>
+#include "esp_timer.h"
 
 static const char *TAG = "webrtc";
 
@@ -22,9 +25,32 @@ static webrtc_on_connected_t         g_on_connected    = NULL;
 static webrtc_on_disconnected_t      g_on_disconnected = NULL;
 static webrtc_on_datachannel_msg_t   g_on_dc_msg       = NULL;
 
+// Periodic IDR retry: fires up to IDR_RETRY_COUNT times, every IDR_RETRY_INTERVAL_MS,
+// after each new WebRTC connection to ensure the Quest gets at least one good IDR.
+#define IDR_RETRY_INTERVAL_MS  2000
+#define IDR_RETRY_COUNT        5
+static esp_timer_handle_t            g_idr_timer       = NULL;
+static volatile int                  g_idr_retry_left  = 0;
+
 // ──────────────────────────────────────────────
 // libpeer callbacks
 // ──────────────────────────────────────────────
+
+// Periodic IDR retry timer callback.
+// Runs as a periodic timer; decrements counter and requests IDR until count hits 0.
+// NO ESP_LOGI here — timer task stack is small and _svfprintf_r overflows it.
+static void idr_retry_timer_cb(void *arg)
+{
+    if (g_idr_retry_left <= 0) {
+        if (g_idr_timer) esp_timer_stop(g_idr_timer);
+        return;
+    }
+    g_idr_retry_left--;
+    camera_request_idr();
+    if (g_idr_retry_left == 0 && g_idr_timer) {
+        esp_timer_stop(g_idr_timer);
+    }
+}
 
 // Called by libpeer when local SDP offer is ready (includes ICE host candidates).
 // libpeer embeds all candidates in the SDP — this is NOT trickle ICE.
@@ -44,27 +70,34 @@ static void on_state_change_cb(PeerConnectionState state, void *userdata)
     ESP_LOGI(TAG, "ICE state: %s", peer_connection_state_to_string(state));
 
     if (state == PEER_CONNECTION_COMPLETED) {
-        // Create DataChannel "fpv" now that DTLS + ICE are established
-        int sid = peer_connection_create_datachannel(
-            g_pc,
-            DATA_CHANNEL_RELIABLE,  // ordered, reliable
-            0,                       // priority
-            0,                       // reliability_parameter
-            "fpv",                   // label
-            ""                       // protocol
-        );
-        if (sid < 0) {
-            ESP_LOGE(TAG, "Failed to create DataChannel");
-        } else {
-            g_dc_sid = sid;
-            ESP_LOGI(TAG, "DataChannel 'fpv' created, sid=%d", sid);
-        }
+        // DataChannel is NOT created here: SCTP socket is just created at this
+        // point (not yet connected). peer_connection_create_datachannel would
+        // fail with "sctp not connected".
+        //
+        // Instead, on_dc_open_cb fires ~50ms later when SCTP connects, and
+        // sets g_dc_sid = 0 there (matching Quest's negotiated=true, id=0 channel).
+        // We do NOT send DATA_CHANNEL_OPEN (peer_connection_create_datachannel)
+        // because the Quest uses a pre-negotiated channel — sending OPEN would
+        // be a protocol violation and may disrupt the Quest side.
         if (g_on_connected) g_on_connected();
+
+        // Start periodic IDR retry: fires IDR_RETRY_COUNT times, every
+        // IDR_RETRY_INTERVAL_MS, so the Quest gets at least one clean IDR
+        // even if the first burst is partially lost over WiFi.
+        if (g_idr_timer) {
+            esp_timer_stop(g_idr_timer);  // no-op if not running
+            g_idr_retry_left = IDR_RETRY_COUNT;
+            // Periodic timer: fires every IDR_RETRY_INTERVAL_MS; callback
+            // decrements counter and stops the timer itself when count hits 0.
+            esp_timer_start_periodic(g_idr_timer, IDR_RETRY_INTERVAL_MS * 1000ULL);
+        }
 
     } else if (state == PEER_CONNECTION_FAILED ||
                state == PEER_CONNECTION_CLOSED ||
                state == PEER_CONNECTION_DISCONNECTED) {
         g_dc_ready = false;
+        g_idr_retry_left = 0;
+        if (g_idr_timer) esp_timer_stop(g_idr_timer);
         if (g_on_disconnected) g_on_disconnected();
     }
 }
@@ -77,12 +110,29 @@ static void on_dc_message_cb(char *msg, size_t len, void *userdata, uint16_t sid
     if (g_on_dc_msg) g_on_dc_msg(msg, len);
 }
 
-// Called when the DataChannel is open (after peer_connection_create_datachannel).
+// Called when the SCTP association is connected (sctp->connected = 1).
+// This fires ~50ms after PEER_CONNECTION_COMPLETED once the SCTP handshake
+// completes — it is NOT a DataChannel-level open event.
+//
+// We set g_dc_sid = 0 here: SCTP stream 0 matches the Quest's
+// negotiated=true, id=0 DataChannel (WebRTC DTLS-client / offerer → even
+// stream IDs; first = 0). No DATA_CHANNEL_OPEN message is needed because the
+// Quest pre-negotiated the channel on its side.
 static void on_dc_open_cb(void *userdata)
 {
     (void)userdata;
+    g_dc_sid   = 0;  // SCTP stream 0: offerer (ESP32) uses even IDs, first = 0
     g_dc_ready = true;
-    ESP_LOGI(TAG, "DataChannel 'fpv' open");
+    ESP_LOGI(TAG, "SCTP connected — DataChannel ready on stream 0");
+}
+
+// Called by libpeer when the Quest sends PLI or FIR via RTCP.
+// We request an IDR from the camera encoder so the Quest can start decoding.
+static void on_keyframe_request_cb(void *userdata)
+{
+    (void)userdata;
+    ESP_LOGI(TAG, "PLI/FIR received — requesting IDR");
+    camera_request_idr();
 }
 
 // Called when the DataChannel closes.
@@ -124,13 +174,27 @@ void webrtc_init(void)
 {
     ESP_LOGI(TAG, "webrtc_init");
 
+    // Create the IDR retry periodic timer once (reused across reconnects).
+    // Periodic avoids re-starting from within callback (which overflows timer stack).
+    if (!g_idr_timer) {
+        esp_timer_create_args_t timer_args = {
+            .callback        = idr_retry_timer_cb,
+            .arg             = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name            = "idr_retry",
+            .skip_unhandled_events = true,
+        };
+        esp_timer_create(&timer_args, &g_idr_timer);
+    }
+
     peer_init();
 
     // ice_servers[5] left zero-initialized — AP mode, no STUN needed (same subnet)
     PeerConfiguration config = {
-        .audio_codec = CODEC_NONE,
-        .video_codec = CODEC_H264,
-        .datachannel = DATA_CHANNEL_STRING,
+        .audio_codec           = CODEC_NONE,
+        .video_codec           = CODEC_H264,
+        .datachannel           = DATA_CHANNEL_STRING,
+        .on_request_keyframe   = on_keyframe_request_cb,
     };
 
     g_pc = peer_connection_create(&config);
@@ -163,7 +227,7 @@ void webrtc_create_offer(void)
 void webrtc_set_answer(const char *sdp)
 {
     if (!g_pc || !sdp) return;
-    ESP_LOGI(TAG, "Setting remote answer (%d bytes)", (int)strlen(sdp));
+    ESP_LOGI(TAG, "Setting remote answer (%d bytes):\n%s", (int)strlen(sdp), sdp);
     peer_connection_set_remote_description(g_pc, (char *)sdp);
 }
 
@@ -182,8 +246,38 @@ void webrtc_push_video_frame(const uint8_t *data, size_t len, uint64_t pts_ms)
 {
     (void)pts_ms;
     if (!g_pc || !data || len == 0) return;
+
     // Only send when fully connected (ICE + DTLS established)
-    if (peer_connection_get_state(g_pc) != PEER_CONNECTION_COMPLETED) return;
+    PeerConnectionState cur_state = peer_connection_get_state(g_pc);
+    static uint32_t s_frame_count = 0;
+    static bool     s_was_completed = false;
+    if (cur_state != PEER_CONNECTION_COMPLETED) {
+        // Log once every 150 frames while waiting, so we know camera is alive
+        static uint32_t s_wait_count = 0;
+        if (++s_wait_count % 150 == 1) {
+            ESP_LOGI(TAG, "push_video: waiting (state=%d total=%"PRIu32")",
+                     (int)cur_state, s_wait_count);
+        }
+        return;
+    }
+    if (!s_was_completed) {
+        s_was_completed = true;
+        ESP_LOGI(TAG, "push_video: first frame after COMPLETED");
+    }
+    s_frame_count++;
+
+    // Find first NAL after Annex-B start code (00 00 00 01 or 00 00 01)
+    const uint8_t *nal = data;
+    if (len > 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1) nal += 4;
+    else if (len > 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1)            nal += 3;
+    uint8_t nal_type = nal[0] & 0x1f;
+
+    if (nal_type == 5) {  // IDR
+        ESP_LOGI(TAG, "push_video: IDR frame #%"PRIu32", len=%zu", s_frame_count, len);
+    } else if (s_frame_count % 30 == 0) {
+        ESP_LOGI(TAG, "push_video: frame #%"PRIu32" type=%d len=%zu", s_frame_count, nal_type, len);
+    }
+
     peer_connection_send_video(g_pc, data, len);
 }
 
@@ -200,6 +294,8 @@ void webrtc_reset(void)
 
     g_dc_ready = false;
     g_dc_sid   = -1;
+    g_idr_retry_left = 0;
+    if (g_idr_timer) esp_timer_stop(g_idr_timer);
 
     if (g_loop_task) {
         vTaskDelete(g_loop_task);

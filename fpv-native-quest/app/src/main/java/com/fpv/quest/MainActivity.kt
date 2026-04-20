@@ -151,6 +151,16 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         urlInput.setText(prefs.getString(PREF_SERVER_URL, DEFAULT_URL))
 
+        // ADB URL override (useful for dev/testing without VR keyboard):
+        //   adb shell am start -n com.fpv.quest/.MainActivity --es server_url "ws://192.168.4.1:8080"
+        intent?.getStringExtra("server_url")?.let { url ->
+            if (url.startsWith("ws://") || url.startsWith("wss://")) {
+                urlInput.setText(url)
+                prefs.edit().putString(PREF_SERVER_URL, url).apply()
+                Log.i(TAG, "URL overridden via intent: $url")
+            }
+        }
+
         // 5. Connect button
         connectButton.setOnClickListener { startConnection() }
 

@@ -33,7 +33,6 @@ class WebRTCEngine {
 
     companion object {
         private const val TAG = "WebRTCEngine"
-        private const val STUN_SERVER = "stun:stun.l.google.com:19302"
 
         // Process-scoped singleton — survives reconnects, never disposed.
         // PeerConnectionFactory.initialize() is called once on first init().
@@ -43,6 +42,12 @@ class WebRTCEngine {
     private var videoTrackRef: VideoTrack? = null
     private var videoSinkRef: VideoSink? = null
     private var eglVideoSinkRef: EglVideoSink? = null
+
+    // Vanilla ICE: store signaling reference so we can send the answer only
+    // after ICE gathering is complete (answer SDP will include all candidates).
+    // libpeer on ESP32 does not support trickle ICE — it needs candidates embedded
+    // in the answer SDP, otherwise ICE fails immediately.
+    @Volatile private var pendingAnswerSignaling: SignalingClient? = null
 
     /** Owns the FPVDataChannel instance; bound once the peer sends a DataChannel. */
     val dataChannel = FPVDataChannel()
@@ -111,14 +116,18 @@ class WebRTCEngine {
         videoSinkRef    = videoSink
         eglVideoSinkRef = eglVideoSink
 
-        val iceServers = listOf(
-            PeerConnection.IceServer.builder(STUN_SERVER).createIceServer()
-        )
-        val config = PeerConnection.RTCConfiguration(iceServers).apply {
-            sdpSemantics              = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            continualGatheringPolicy  = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-            bundlePolicy              = PeerConnection.BundlePolicy.MAXBUNDLE
-            rtcpMuxPolicy             = PeerConnection.RtcpMuxPolicy.REQUIRE
+        // No STUN server: ESP32 runs its own WiFi AP (192.168.4.0/24) with no internet.
+        // STUN (stun.l.google.com) would time out waiting for DNS/connection (~30 s),
+        // blocking ICE gathering completion. Host candidates are sufficient on the same subnet.
+        // Re-add STUN here if using a router with internet access instead of the ESP32 AP.
+        val config = PeerConnection.RTCConfiguration(emptyList()).apply {
+            sdpSemantics             = PeerConnection.SdpSemantics.UNIFIED_PLAN
+            // GATHER_ONCE: gathering completes after collecting host candidates, then fires
+            // IceGatheringState.COMPLETE. We send the answer SDP only at that point so
+            // the SDP includes embedded candidates (vanilla ICE, compatible with libpeer).
+            continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
+            bundlePolicy             = PeerConnection.BundlePolicy.MAXBUNDLE
+            rtcpMuxPolicy            = PeerConnection.RtcpMuxPolicy.REQUIRE
         }
 
         pc = factory!!.createPeerConnection(config, object : PeerConnection.Observer {
@@ -129,8 +138,9 @@ class WebRTCEngine {
             // ── ICE ──────────────────────────────────────────────────────────
 
             override fun onIceCandidate(candidate: IceCandidate) {
-                Log.d(TAG, "local ICE: ${candidate.sdpMid} ${candidate.sdp.take(40)}")
-                signaling.sendIce(candidate.sdp, candidate.sdpMLineIndex, candidate.sdpMid)
+                // Vanilla ICE: candidates are embedded in the answer SDP sent on
+                // IceGatheringState.COMPLETE — no trickle candidates needed.
+                Log.d(TAG, "local ICE gathered: ${candidate.sdpMid} ${candidate.sdp.take(60)}")
             }
 
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) {
@@ -147,6 +157,15 @@ class WebRTCEngine {
 
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
                 Log.d(TAG, "ICE gathering: $state")
+                if (state == PeerConnection.IceGatheringState.COMPLETE) {
+                    // All local candidates collected — local description now contains
+                    // embedded a=candidate lines. Send answer so libpeer gets a full SDP.
+                    val sig = pendingAnswerSignaling ?: return
+                    pendingAnswerSignaling = null
+                    val localSdp = pc?.localDescription?.description ?: return
+                    sig.sendAnswer(localSdp)
+                    Log.i(TAG, "ICE gathering complete — answer sent (${localSdp.length} bytes)")
+                }
             }
 
             // ── Tracks (UNIFIED_PLAN — use onTrack, not onAddStream) ─────────
@@ -232,6 +251,11 @@ class WebRTCEngine {
         // Log m= sections to confirm DataChannel (m=application) is in the offer
         val sections = sdp.lines().filter { it.startsWith("m=") }
         Log.i(TAG, "Offer sections (${sections.size}): ${sections.joinToString(" | ")}")
+
+        // Store signaling for later — answer is sent in onIceGatheringChange(COMPLETE)
+        // with all local candidates already embedded in the SDP (vanilla ICE).
+        pendingAnswerSignaling = signaling
+
         val offer = SessionDescription(SessionDescription.Type.OFFER, sdp)
         pc?.setRemoteDescription(
             sdpObserver("setRemote") {
@@ -241,8 +265,8 @@ class WebRTCEngine {
                         val answer = SessionDescription(SessionDescription.Type.ANSWER, finalSdp)
                         pc?.setLocalDescription(
                             sdpObserver("setLocal") {
-                                signaling.sendAnswer(finalSdp)
-                                Log.i(TAG, "answer sent")
+                                // Answer will be sent in onIceGatheringChange(COMPLETE)
+                                Log.i(TAG, "local description set — waiting for ICE gathering")
                             },
                             answer
                         )
