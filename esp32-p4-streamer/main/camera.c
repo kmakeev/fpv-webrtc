@@ -21,6 +21,11 @@
 #include "esp_ldo_regulator.h"
 #include "driver/i2c_master.h"
 #include "driver/isp.h"
+#include "driver/isp_awb.h"
+#include "driver/isp_ae.h"
+#include "driver/isp_sharpen.h"
+#include "driver/isp_color.h"
+#include "driver/isp_gamma.h"
 #include "esp_cam_ctlr_csi.h"
 #include "esp_cam_ctlr.h"
 #include "esp_sccb_intf.h"
@@ -61,6 +66,10 @@ static const char *TAG = "camera";
 // Number of capture (DMA) buffers.
 // Must satisfy: NUM_CAP_BUFS × frame_interval_ms > encode_time_ms
 #define NUM_CAP_BUFS     6
+
+// H.264 GOP (keyframe period): IDR every ~0.5s at 30fps.
+// Shorter than enc_fps (1s) — faster recovery after packet loss.
+#define ENC_GOP          15
 
 // ──────────────────────────────────────────────
 // Module state
@@ -129,6 +138,17 @@ static IRAM_ATTR bool s_cam_trans_finished(esp_cam_ctlr_handle_t handle,
     return woken == pdTRUE;
 }
 
+// AWB statistics done callback (ISR context) — required for continuous mode.
+// The ISP hardware applies AWB corrections internally; we just need to register
+// the callback so start_continuous_statistics doesn't reject with "not registered".
+static IRAM_ATTR bool s_awb_stats_done(isp_awb_ctlr_t ctlr,
+                                        const esp_isp_awb_evt_data_t *edata,
+                                        void *user_data)
+{
+    (void)ctlr; (void)edata; (void)user_data;
+    return false;  // no high-priority task woken
+}
+
 // ──────────────────────────────────────────────
 // Camera + encode task  (pinned to core 1)
 // ──────────────────────────────────────────────
@@ -152,14 +172,31 @@ static void camera_task(void *arg)
     const uint8_t *frame_buf = NULL;
     uint32_t task_frame_count = 0;
 
+    // Task 1: FPS measurement
+    static int64_t  s_fps_ts_us    = 0;
+    static uint32_t s_fps_frame_ref = 0;
+    // Task 6: encode-time statistics
+    static uint32_t s_enc_sum_ms = 0;
+    static uint32_t s_enc_count  = 0;
+
     while (1) {
         if (xQueueReceive(g_frame_q, &frame_buf, portMAX_DELAY) != pdTRUE) {
             continue;
         }
         task_frame_count++;
-        // Heartbeat: first frame + every 30 frames
+        // Heartbeat: first frame + every 30 frames — with real FPS
         if (task_frame_count == 1 || task_frame_count % 30 == 0) {
-            ESP_LOGI(TAG, "camera_task: frame #%"PRIu32, task_frame_count);
+            int64_t now_us = esp_timer_get_time();
+            if (s_fps_ts_us > 0 && task_frame_count > s_fps_frame_ref) {
+                float elapsed_s = (float)(now_us - s_fps_ts_us) / 1e6f;
+                float fps = (float)(task_frame_count - s_fps_frame_ref) / elapsed_s;
+                ESP_LOGI(TAG, "camera_task: frame #%"PRIu32" — %.1f fps (task-side)",
+                         task_frame_count, fps);
+            } else {
+                ESP_LOGI(TAG, "camera_task: frame #%"PRIu32, task_frame_count);
+            }
+            s_fps_ts_us     = now_us;
+            s_fps_frame_ref = task_frame_count;
         }
 
         // Force IDR: set GOP=1 so the encoder sees a GOP change and emits IDR.
@@ -194,16 +231,25 @@ static void camera_task(void *arg)
                          out_frame.length, encode_ms);
                 first_frame = false;
             }
+            s_enc_sum_ms += encode_ms;
+            s_enc_count++;
+            if (s_enc_count % 150 == 0) {
+                uint32_t avg_ms = s_enc_sum_ms / s_enc_count;
+                ESP_LOGI(TAG, "H.264 encode avg=%"PRIu32"ms over %"PRIu32" frames",
+                         avg_ms, s_enc_count);
+                s_enc_sum_ms = 0;
+                s_enc_count  = 0;
+            }
 
-            // After a forced IDR (or any IDR while GOP != g_enc_fps), restore GOP.
+            // After a forced IDR (or any IDR while GOP != ENC_GOP), restore GOP.
             if (out_frame.frame_type == ESP_H264_FRAME_TYPE_IDR) {
                 esp_h264_enc_param_handle_t ph = s_get_param_hd();
                 if (ph) {
                     uint8_t cur_gop = 0;
                     esp_h264_enc_get_gop(ph, &cur_gop);
-                    if (cur_gop != g_enc_fps) {
-                        esp_h264_enc_set_gop(ph, g_enc_fps);
-                        ESP_LOGI(TAG, "IDR sent — GOP restored to %d", (int)g_enc_fps);
+                    if (cur_gop != ENC_GOP) {
+                        esp_h264_enc_set_gop(ph, ENC_GOP);
+                        ESP_LOGI(TAG, "IDR sent — GOP restored to %d", ENC_GOP);
                     }
                 }
             }
@@ -455,6 +501,113 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
     ESP_RETURN_ON_ERROR(esp_isp_enable(isp_hdl),
                         TAG, "ISP enable failed");
 
+    // ── AWB: auto white balance ──
+    esp_isp_awb_config_t awb_cfg = {
+        .sample_point = ISP_AWB_SAMPLE_POINT_AFTER_CCM,
+        .window = {
+            .top_left  = { .x = g_cam_width / 5,     .y = g_cam_height / 5 },
+            .btm_right = { .x = g_cam_width * 4 / 5, .y = g_cam_height * 4 / 5 },
+        },
+        .white_patch = {
+            .luminance        = { .min = 0, .max = 220 * 3 },
+            .red_green_ratio  = { .min = 0.0f, .max = 3.999f },
+            .blue_green_ratio = { .min = 0.0f, .max = 3.999f },
+        },
+    };
+    isp_awb_ctlr_t awb_ctlr = NULL;
+    esp_err_t awb_ret = esp_isp_new_awb_controller(isp_hdl, &awb_cfg, &awb_ctlr);
+    if (awb_ret == ESP_OK) {
+        // Register callback — required by start_continuous_statistics
+        esp_isp_awb_cbs_t awb_cbs = { .on_statistics_done = s_awb_stats_done };
+        esp_isp_awb_register_event_callbacks(awb_ctlr, &awb_cbs, NULL);
+        esp_isp_awb_controller_enable(awb_ctlr);
+        esp_isp_awb_controller_start_continuous_statistics(awb_ctlr);
+        ESP_LOGI(TAG, "ISP AWB controller started");
+    } else {
+        ESP_LOGW(TAG, "ISP AWB init failed (%s)", esp_err_to_name(awb_ret));
+    }
+
+    // ── AE: auto exposure ──
+    esp_isp_ae_config_t ae_cfg = {
+        .sample_point = ISP_AE_SAMPLE_POINT_AFTER_DEMOSAIC,
+    };
+    isp_ae_ctlr_t ae_ctlr = NULL;
+    esp_err_t ae_ret = esp_isp_new_ae_controller(isp_hdl, &ae_cfg, &ae_ctlr);
+    if (ae_ret == ESP_OK) {
+        esp_isp_ae_controller_enable(ae_ctlr);
+        esp_isp_ae_controller_start_continuous_statistics(ae_ctlr);
+        ESP_LOGI(TAG, "ISP AE controller started");
+    } else {
+        ESP_LOGW(TAG, "ISP AE init failed (%s)", esp_err_to_name(ae_ret));
+    }
+
+    // ── ISP Sharpen: edge enhancement ──
+    // h_freq_coeff=2.0, m_freq_coeff=1.5 — noticeable sharpening for FPV.
+    // Lower thresholds (h=30, l=5) to catch more edges.
+    esp_isp_sharpen_config_t sharpen_cfg = {
+        .h_freq_coeff = { .val = (2 << ISP_SHARPEN_H_FREQ_COEF_DEC_BITS) },                                   // 2.0
+        .m_freq_coeff = { .val = (1 << ISP_SHARPEN_M_FREQ_COEF_DEC_BITS) | (1 << (ISP_SHARPEN_M_FREQ_COEF_DEC_BITS - 1)) },  // 1.5
+        .h_thresh = 30,
+        .l_thresh = 5,
+        .padding_mode = ISP_SHARPEN_EDGE_PADDING_MODE_SRND_DATA,
+        .sharpen_template = {
+            {1, 2, 1},
+            {2, 4, 2},
+            {1, 2, 1},
+        },
+    };
+    esp_err_t shp_ret = esp_isp_sharpen_configure(isp_hdl, &sharpen_cfg);
+    if (shp_ret == ESP_OK) {
+        esp_isp_sharpen_enable(isp_hdl);
+        ESP_LOGI(TAG, "ISP Sharpen enabled (h_coeff=2.0, m_coeff=1.5)");
+    } else {
+        ESP_LOGW(TAG, "ISP Sharpen configure failed (%s)", esp_err_to_name(shp_ret));
+    }
+
+    // ── ISP Color: contrast + saturation boost ──
+    // Default is 1.0 for both — grey washed-out image needs more contrast/saturation.
+    // Fixed-point: integer(1 bit) + decimal(7 bits). 1.0 = 0x80, 1.3 = 0x80|38, 1.5 = 0x80|64
+    esp_isp_color_config_t color_cfg = {
+        .color_contrast   = { .val = (1 << 7) | 64 },  // 1.5 — strong contrast
+        .color_saturation = { .val = (1 << 7) | 127 }, // ~2.0 — max vivid colors
+        .color_hue        = 0,
+        .color_brightness = -15,                        // compensate gamma lift
+    };
+    esp_err_t clr_ret = esp_isp_color_configure(isp_hdl, &color_cfg);
+    if (clr_ret == ESP_OK) {
+        esp_isp_color_enable(isp_hdl);
+        ESP_LOGI(TAG, "ISP Color enabled (contrast=1.5, saturation=2.0, brightness=-15)");
+    } else {
+        ESP_LOGW(TAG, "ISP Color configure failed (%s)", esp_err_to_name(clr_ret));
+    }
+
+    // ── ISP Gamma: subtle lift, keep image darker ──
+    // gamma ≈ 1/1.3: minimal shadow lift, preserves natural contrast.
+    // y = 255 * pow(x/255, 1/1.3)
+    isp_gamma_curve_points_t gamma_pts = { .pt = {
+        { .x =  16, .y =  28 },
+        { .x =  32, .y =  48 },
+        { .x =  48, .y =  64 },
+        { .x =  64, .y =  79 },
+        { .x =  80, .y =  93 },
+        { .x =  96, .y = 107 },
+        { .x = 112, .y = 119 },
+        { .x = 128, .y = 132 },
+        { .x = 144, .y = 144 },
+        { .x = 160, .y = 156 },
+        { .x = 176, .y = 168 },
+        { .x = 192, .y = 180 },
+        { .x = 208, .y = 192 },
+        { .x = 224, .y = 204 },
+        { .x = 240, .y = 216 },
+        { .x = 255, .y = 255 },
+    }};
+    esp_isp_gamma_configure(isp_hdl, COLOR_COMPONENT_R, &gamma_pts);
+    esp_isp_gamma_configure(isp_hdl, COLOR_COMPONENT_G, &gamma_pts);
+    esp_isp_gamma_configure(isp_hdl, COLOR_COMPONENT_B, &gamma_pts);
+    esp_isp_gamma_enable(isp_hdl);
+    ESP_LOGI(TAG, "ISP Gamma enabled (gamma=1.3 correction)");
+
     // ── 9. Start CSI (calls on_get_new_trans to obtain the first buffer) ──
     ESP_RETURN_ON_ERROR(esp_cam_ctlr_start(g_cam_hdl),
                         TAG, "CSI start failed");
@@ -474,23 +627,28 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
 
     // ── 12. H.264 HW encoder (VEU) ──
     // ESP32-P4 rev 1.x (chip_rev < 3.0) only supports O_UYY_E_VYY input.
-    // Use sensor fps for GOP interval so keyframe period stays at 1 second.
-    uint8_t enc_fps = selected->fps > 0 ? selected->fps : CAM_FPS;
+    // enc_fps for rate control: HW encoder takes ~81ms/frame at 800x640, so actual
+    // throughput is ~12 fps regardless of sensor speed. Setting RC fps to match
+    // reality lets the rate controller allocate the right number of bits per frame.
+    // With fps=50 and 1.1Mbps, RC allocated only 22Kbit/frame (P-frames 2-4KB).
+    // With fps=15 and 4Mbps, RC allocates ~267Kbit/frame — much better quality.
+    uint8_t enc_fps = 15;  // match actual encode throughput, not sensor fps
     g_enc_fps = enc_fps;
-    // Scale bitrate with pixel count relative to 1280×720 baseline at 2 Mbps.
+    // Scale bitrate: 4 Mbps baseline at 1280×720, scaled by pixel count.
+    // Single WiFi AP client (Quest) easily handles 4-6 Mbps.
     uint32_t pixels     = (uint32_t)g_cam_width * g_cam_height;
-    uint32_t bitrate    = (uint32_t)(2000000ULL * pixels / (1280 * 720));
-    if (bitrate < 1000000) bitrate = 1000000;
+    uint32_t bitrate    = (uint32_t)(4000000ULL * pixels / (1280 * 720));
+    if (bitrate < 1500000) bitrate = 1500000;
     if (bitrate > 8000000) bitrate = 8000000;
-    ESP_LOGI(TAG, "H.264 encoder: %ux%u fps=%u gop=%u bitrate=%"PRIu32,
-             g_cam_width, g_cam_height, enc_fps, enc_fps, bitrate);
+    ESP_LOGI(TAG, "H.264 encoder: %ux%u fps=%u gop=%d qp=[20,38] bitrate=%"PRIu32,
+             g_cam_width, g_cam_height, enc_fps, ENC_GOP, bitrate);
 
     esp_h264_enc_cfg_hw_t enc_cfg = {
         .pic_type = ESP_H264_RAW_FMT_O_UYY_E_VYY,
-        .gop      = enc_fps,
+        .gop      = ENC_GOP,
         .fps      = enc_fps,
         .res      = { .width = g_cam_width, .height = g_cam_height },
-        .rc       = { .bitrate = bitrate, .qp_min = 25, .qp_max = 45 },
+        .rc       = { .bitrate = bitrate, .qp_min = 20, .qp_max = 38 },
     };
     esp_h264_err_t h264_ret = esp_h264_enc_hw_new(&enc_cfg, &g_encoder);
     if (h264_ret != ESP_H264_ERR_OK) {

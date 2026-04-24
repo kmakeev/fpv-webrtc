@@ -131,6 +131,13 @@ static void on_dc_open_cb(void *userdata)
 static void on_keyframe_request_cb(void *userdata)
 {
     (void)userdata;
+    static int64_t s_last_idr_req_us = 0;
+    int64_t now_us = esp_timer_get_time();
+    if ((now_us - s_last_idr_req_us) < 1500000LL) {
+        ESP_LOGD(TAG, "PLI/FIR: rate-limited, skip IDR request");
+        return;
+    }
+    s_last_idr_req_us = now_us;
     ESP_LOGI(TAG, "PLI/FIR received — requesting IDR");
     camera_request_idr();
 }
