@@ -14,6 +14,14 @@
 static const char *TAG = "webrtc";
 
 // ──────────────────────────────────────────────
+// ABR (Adaptive Bitrate) constants
+// ──────────────────────────────────────────────
+
+#define ABR_MIN_BPS          500000U
+#define ABR_MAX_BPS         8000000U
+#define ABR_RAISE_DELAY_US  5000000LL   // 5 s without loss → raise bitrate
+
+// ──────────────────────────────────────────────
 // Globals
 // ──────────────────────────────────────────────
 
@@ -32,6 +40,10 @@ static webrtc_on_datachannel_msg_t   g_on_dc_msg       = NULL;
 static esp_timer_handle_t            g_idr_timer       = NULL;
 static volatile int                  g_idr_retry_left  = 0;
 
+// ABR state: 0 = not yet initialised (lazy-read from camera_get_bitrate on first RR)
+static uint32_t g_abr_bitrate  = 0;
+static int64_t  g_abr_good_us  = 0;    // start of the "no-loss" period (0 = not started)
+
 // ──────────────────────────────────────────────
 // libpeer callbacks
 // ──────────────────────────────────────────────
@@ -49,6 +61,50 @@ static void idr_retry_timer_cb(void *arg)
     camera_request_idr();
     if (g_idr_retry_left == 0 && g_idr_timer) {
         esp_timer_stop(g_idr_timer);
+    }
+}
+
+// Called by libpeer with each RTCP Receiver Report.
+// fraction_loss is in [0,1]; fraction_lost/256 per spec, but libpeer divides by 256 already.
+// Logic:
+//   fraction_loss > 20/256 (~8%) → reduce bitrate 20%, request IDR
+//   fraction_loss == 0 for ≥5 s  → raise bitrate 10%
+//   otherwise (loss but < threshold) → reset raise timer
+static void on_receiver_packet_loss_cb(float fraction_loss,
+                                        uint32_t total_loss, void *userdata)
+{
+    (void)userdata;
+    (void)total_loss;
+
+    // Lazy initialise from encoder on first callback
+    if (g_abr_bitrate == 0) g_abr_bitrate = camera_get_bitrate();
+    if (g_abr_bitrate == 0) return;   // encoder not ready yet
+
+    int64_t now = esp_timer_get_time();
+
+    if (fraction_loss * 256.0f > 20.0f) {
+        // Loss above threshold — reduce 20%
+        uint32_t nb = (uint32_t)(g_abr_bitrate * 0.8f);
+        if (nb < ABR_MIN_BPS) nb = ABR_MIN_BPS;
+        if (nb != g_abr_bitrate) {
+            g_abr_bitrate = nb;
+            camera_set_bitrate(nb);
+            camera_request_idr();   // IDR after bitrate drop accelerates decoder recovery
+        }
+        g_abr_good_us = 0;   // reset raise timer
+    } else if (fraction_loss == 0.0f) {
+        if (g_abr_good_us == 0) g_abr_good_us = now;
+        if ((now - g_abr_good_us) >= ABR_RAISE_DELAY_US) {
+            uint32_t nb = (uint32_t)(g_abr_bitrate * 1.1f);
+            if (nb > ABR_MAX_BPS) nb = ABR_MAX_BPS;
+            if (nb != g_abr_bitrate) {
+                g_abr_bitrate = nb;
+                camera_set_bitrate(nb);
+            }
+            g_abr_good_us = now;   // slide window: next raise in another 5 s
+        }
+    } else {
+        g_abr_good_us = 0;   // some loss, but below threshold — reset raise timer
     }
 }
 
@@ -213,6 +269,7 @@ void webrtc_init(void)
     peer_connection_onicecandidate(g_pc, on_ice_candidate_cb);
     peer_connection_oniceconnectionstatechange(g_pc, on_state_change_cb);
     peer_connection_ondatachannel(g_pc, on_dc_message_cb, on_dc_open_cb, on_dc_close_cb);
+    peer_connection_on_receiver_packet_loss(g_pc, on_receiver_packet_loss_cb);
 
     // Dedicated task drives ICE gathering, DTLS handshake, SCTP
     xTaskCreatePinnedToCore(peer_loop_task, "pc_loop", 8192, NULL, 6, &g_loop_task, 0);
@@ -303,6 +360,8 @@ void webrtc_reset(void)
     g_dc_sid   = -1;
     g_idr_retry_left = 0;
     if (g_idr_timer) esp_timer_stop(g_idr_timer);
+    g_abr_bitrate = 0;
+    g_abr_good_us = 0;
 
     if (g_loop_task) {
         vTaskDelete(g_loop_task);

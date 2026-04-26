@@ -31,6 +31,10 @@
   let _e2eMs    = null;   // SCTP-задержка DataChannel
   let _encodeMs = null;   // время энкодинга на стримере
 
+  // Freeze detection: consecutive 1-s polls with unchanged framesDecoded
+  let _frozenCount   = 0;
+  let _prevFreezeRef = 0;   // framesDecoded at last freeze-check
+
   // Элементы основного статус-бара (под кнопками)
   const bar = {
     latency:    document.getElementById('stat-latency'),
@@ -128,6 +132,24 @@
         _prevTs     = inbound.timestamp;
       }
 
+      // ── Freeze detection ─────────────────────────────────────────────────
+      // If framesDecoded stops increasing for ≥3 consecutive polls (≥3 s) while
+      // the peer connection is alive, send a DataChannel PLI to force an IDR.
+      // ESP32 datachannel.c bypasses the 1.5 s network PLI rate-limit for this.
+      if (inbound && _pc?.connectionState === 'connected') {
+        const curFrames = inbound.framesDecoded || 0;
+        if (curFrames === _prevFreezeRef && curFrames > 0) {
+          if (++_frozenCount >= 3) {
+            console.warn('[Stats] Video freeze detected — requesting IDR via DataChannel');
+            if (window.FPVDataChannel) FPVDataChannel.send({ type: 'pli' });
+            _frozenCount = 0;   // reset so we don't spam; next request in ≥3 s
+          }
+        } else {
+          _frozenCount = 0;
+        }
+        _prevFreezeRef = curFrames;
+      }
+
       // ── Разрешение ───────────────────────────────────────────────────────
       const w = inbound?.frameWidth;
       const h = inbound?.frameHeight;
@@ -211,9 +233,11 @@
     },
     stop() {
       clearInterval(_timer);
-      _pc       = null;
-      _e2eMs    = null;
-      _encodeMs = null;
+      _pc          = null;
+      _e2eMs       = null;
+      _encodeMs    = null;
+      _frozenCount   = 0;
+      _prevFreezeRef = 0;
       _reset();
     },
 

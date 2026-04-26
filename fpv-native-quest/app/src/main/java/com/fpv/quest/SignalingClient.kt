@@ -1,6 +1,14 @@
 package com.fpv.quest
 
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -18,6 +26,9 @@ import javax.net.ssl.X509TrustManager
  * WebSocket signaling client — mirrors the protocol of server/server.js and
  * the JS implementation in public/js/webrtc-client.js.
  *
+ * Reconnects automatically with exponential backoff [1s, 2s, 4s, 8s, 30s] on
+ * connection failure or closure. Call close() to stop reconnecting.
+ *
  * Message types (server.js protocol):
  *   role             viewer → server  {"type":"role","role":"viewer"}
  *   offer            server → viewer  {"type":"offer","sdp":"..."}
@@ -25,9 +36,6 @@ import javax.net.ssl.X509TrustManager
  *   ice              both ways        {"type":"ice","candidate":"...","sdpMLineIndex":0,"sdpMid":"0"}
  *   viewer_ready     server → viewer  {"type":"viewer_ready"}
  *   peer_disconnected server → viewer {"type":"peer_disconnected"}
- *
- * TASK-002: constructor + connect() stub.
- * TODO TASK-003: wire callbacks into WebRTCEngine.
  */
 class SignalingClient(
     private val onOffer: (sdp: String) -> Unit,
@@ -44,6 +52,8 @@ class SignalingClient(
         const val TYPE_ICE = "ice"
         const val TYPE_VIEWER_READY = "viewer_ready"
         const val TYPE_PEER_DISCONNECTED = "peer_disconnected"
+
+        private val BACKOFF_MS = longArrayOf(1_000, 2_000, 4_000, 8_000, 30_000)
     }
 
     // Trust all TLS certificates — required for the self-signed LAN cert (Quest 2
@@ -68,12 +78,40 @@ class SignalingClient(
     }
 
     private var ws: WebSocket? = null
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var reconnectJob: Job? = null
 
-    /** Connect to the signaling server and register as "viewer". */
+    @Volatile private var reconnectEnabled = false
+    @Volatile private var backoffIndex = 0
+    @Volatile private var currentUrl = ""
+
+    /** Called when a reconnect attempt is about to be scheduled. delayMs = wait time. */
+    var onReconnecting: ((delayMs: Long) -> Unit)? = null
+
+    /** Connect to the signaling server and register as "viewer". Enables auto-reconnect. */
     fun connect(url: String) {
-        Log.i(TAG, "Connecting to $url")
-        val request = Request.Builder().url(url).build()
+        currentUrl = url
+        reconnectEnabled = true
+        backoffIndex = 0
+        _connectWs()
+    }
+
+    private fun _connectWs() {
+        Log.i(TAG, "Connecting to $currentUrl (backoffIndex=$backoffIndex)")
+        val request = Request.Builder().url(currentUrl).build()
         ws = httpClient.newWebSocket(request, Listener())
+    }
+
+    private fun handleDisconnect() {
+        onDisconnected()
+        if (!reconnectEnabled) return
+        val delay = BACKOFF_MS.getOrElse(backoffIndex) { 30_000L }
+        if (backoffIndex < BACKOFF_MS.size - 1) backoffIndex++
+        onReconnecting?.invoke(delay)
+        reconnectJob = scope.launch {
+            delay(delay)
+            if (isActive && reconnectEnabled) _connectWs()
+        }
     }
 
     /** Send the SDP answer produced by WebRTCEngine. */
@@ -95,6 +133,10 @@ class SignalingClient(
     }
 
     fun close() {
+        reconnectEnabled = false
+        reconnectJob?.cancel()
+        reconnectJob = null
+        scope.cancel()
         ws?.close(1000, "App closing")
         ws = null
     }
@@ -108,6 +150,7 @@ class SignalingClient(
     private inner class Listener : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             Log.i(TAG, "Connected")
+            backoffIndex = 0
             // Register as viewer — triggers streamer's viewer_ready
             send(JSONObject().apply {
                 put("type", TYPE_ROLE)
@@ -146,7 +189,7 @@ class SignalingClient(
                     }
                     TYPE_PEER_DISCONNECTED -> {
                         Log.i(TAG, "peer disconnected")
-                        onDisconnected()
+                        handleDisconnect()
                     }
                     TYPE_VIEWER_READY -> Log.d(TAG, "viewer_ready (no-op on viewer side)")
                     else -> Log.w(TAG, "Unknown message type: ${msg.optString("type")}")
@@ -158,13 +201,13 @@ class SignalingClient(
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             Log.e(TAG, "WebSocket failure: ${t.message}")
-            onDisconnected()
+            handleDisconnect()
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
             Log.i(TAG, "WebSocket closing: $code $reason")
             webSocket.close(1000, null)
-            onDisconnected()
+            handleDisconnect()
         }
     }
 }

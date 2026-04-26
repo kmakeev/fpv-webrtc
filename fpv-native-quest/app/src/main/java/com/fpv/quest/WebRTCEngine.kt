@@ -2,6 +2,13 @@ package com.fpv.quest
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import org.webrtc.DataChannel
 import org.webrtc.EglBase
 import org.webrtc.HardwareVideoDecoderFactory
@@ -42,6 +49,7 @@ class WebRTCEngine {
     private var videoTrackRef: VideoTrack? = null
     private var videoSinkRef: VideoSink? = null
     private var eglVideoSinkRef: EglVideoSink? = null
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     // Vanilla ICE: store signaling reference so we can send the answer only
     // after ICE gathering is complete (answer SDP will include all candidates).
@@ -232,6 +240,28 @@ class WebRTCEngine {
             Log.e(TAG, "Failed to create negotiated DataChannel")
         }
 
+        // Freeze watcher: if EglVideoSink.frameCount stops increasing for ≥3 consecutive
+        // seconds while the connection is alive, send a DataChannel PLI to force an IDR.
+        // ESP32 datachannel.c bypasses the 1.5 s network PLI rate-limit for this message type.
+        scope.launch {
+            var prevCount = -1L
+            var frozenTicks = 0
+            while (isActive && pc != null) {
+                delay(1_000)
+                val count = eglVideoSinkRef?.frameCount ?: continue
+                if (count == prevCount) {
+                    if (prevCount >= 0 && ++frozenTicks >= 3) {
+                        Log.w(TAG, "Video freeze detected — sending DataChannel PLI")
+                        dataChannel.sendVideoFreezeRequest()
+                        frozenTicks = 0   // reset; next PLI in ≥3 s if still frozen
+                    }
+                } else {
+                    frozenTicks = 0
+                    prevCount = count
+                }
+            }
+        }
+
         Log.i(TAG, "PeerConnection created")
     }
 
@@ -288,6 +318,8 @@ class WebRTCEngine {
     }
 
     fun close() {
+        scope.cancel()   // stop freeze watcher coroutine
+
         // Remove sinks before disposing to prevent a crash in some SDK versions
         videoTrackRef?.removeSink(videoSinkRef)
         eglVideoSinkRef?.let { videoTrackRef?.removeSink(it) }

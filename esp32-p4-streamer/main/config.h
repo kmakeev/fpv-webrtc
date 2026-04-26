@@ -12,6 +12,8 @@
 #define SPIFFS_BASE_PATH    "/www"
 
 // Параметры камеры
-#define CAM_WIDTH           1280
-#define CAM_HEIGHT          720
+// 800×640 RAW8 — default: encode ~25ms, stable 30fps, safe 6-buffer ring.
+// Switch at runtime via DataChannel { type:'resolution', w:1280, h:960 }.
+#define CAM_WIDTH           800
+#define CAM_HEIGHT          640
 #define CAM_FPS             30

@@ -1,6 +1,7 @@
 // PROMPT-05: DataChannel ping/pong clock sync + ts timestamp messages
 #include "datachannel.h"
 #include "webrtc_streamer.h"
+#include "camera.h"
 #include "config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -123,6 +124,22 @@ void datachannel_on_message(const char *json_str, size_t len)
             cJSON_AddNumberToObject(pong, "t0",   t0);
             cJSON_AddNumberToObject(pong, "t1",   t1);
             dc_send(pong);
+        }
+    } else if (strcmp(type, "pli") == 0) {
+        // DataChannel PLI from viewer (freeze recovery) — BYPASS network rate-limit.
+        // Network PLI/FIR in webrtc_streamer.c is rate-limited to 1.5 s;
+        // DataChannel PLI is used for application-level freeze recovery and has no limit.
+        ESP_LOGI(TAG, "DataChannel PLI: forcing IDR (freeze recovery)");
+        camera_request_idr();
+
+    } else if (strcmp(type, "resolution") == 0) {
+        cJSON *w_item = cJSON_GetObjectItem(msg, "w");
+        cJSON *h_item = cJSON_GetObjectItem(msg, "h");
+        if (cJSON_IsNumber(w_item) && cJSON_IsNumber(h_item)) {
+            uint16_t w = (uint16_t)w_item->valueint;
+            uint16_t h = (uint16_t)h_item->valueint;
+            ESP_LOGI(TAG, "Resolution switch requested: %ux%u", w, h);
+            camera_set_resolution(w, h);
         }
     }
     // Unknown types are silently ignored (e.g. future "head" pose messages)

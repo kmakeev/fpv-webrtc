@@ -338,13 +338,17 @@ class MainActivity : Activity() {
                 engine?.handleRemoteIce(candidate, sdpMLineIndex, sdpMid)
             },
             onDisconnected = {
-                xrThread?.showStatus("No signal — check server address")
-                runOnUiThread {
-                    setStatus("Disconnected — check server and reconnect")
-                    overlay.visibility = View.VISIBLE
-                }
+                // SignalingClient will auto-reconnect — do NOT show overlay.
+                // onReconnecting below shows the delay in the status bar.
+                xrThread?.showStatus("Signal lost — reconnecting…")
+                runOnUiThread { setStatus("Signal lost — reconnecting…") }
             }
         )
+        signaling!!.onReconnecting = { delayMs ->
+            val delaySec = delayMs / 1000
+            xrThread?.showStatus("Reconnecting in ${delaySec}s…")
+            runOnUiThread { setStatus("Reconnecting in ${delaySec}s…") }
+        }
 
         engine!!.start(
             signaling    = signaling!!,

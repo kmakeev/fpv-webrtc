@@ -24,7 +24,9 @@
   let reconnTimer = null;
   let stream      = null;          // входящий MediaStream
 
-  const RECONNECT_DELAY = 3000;
+  const RECONNECT_MIN   = 1000;
+  const RECONNECT_MAX   = 30000;
+  let   _reconnectDelay = RECONNECT_MIN;
 
   // ── Публичный API ─────────────────────────────────────────────────────────
   const FPVClient = {
@@ -56,6 +58,7 @@
 
     ws.onopen = () => {
       console.log('[WS] connected');
+      _reconnectDelay = RECONNECT_MIN;  // reset backoff on successful connect
       // Регистрируемся как viewer
       _send({ type: 'role', role: 'viewer' });
       FPVClient.onStatus('waiting', 'Ожидание стримера...');
@@ -70,10 +73,12 @@
 
     ws.onclose = (ev) => {
       console.log('[WS] closed', ev.code);
-      FPVClient.onStatus('disconnected', 'WS закрыт, переподключение...');
       FPVClient.onDisconnect();
       _cleanup();
-      reconnTimer = setTimeout(_connectWs, RECONNECT_DELAY);
+      const delay = _reconnectDelay;
+      _reconnectDelay = Math.min(_reconnectDelay * 2, RECONNECT_MAX);
+      FPVClient.onStatus('disconnected', `WS закрыт, повтор через ${Math.round(delay / 1000)}с`);
+      reconnTimer = setTimeout(_connectWs, delay);
     };
 
     ws.onerror = (e) => {

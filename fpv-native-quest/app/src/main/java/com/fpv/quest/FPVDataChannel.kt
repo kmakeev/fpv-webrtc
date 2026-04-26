@@ -213,6 +213,16 @@ class FPVDataChannel {
     fun getOffset(): Long = clockOffset
     fun isSynced(): Boolean = clockSynced
 
+    /**
+     * Send a DataChannel PLI to request an IDR frame immediately.
+     * Used by the freeze watcher in WebRTCEngine when framesDecoded stalls ≥3 s.
+     * ESP32 datachannel.c bypasses the 1.5 s network PLI rate-limit for this message type.
+     */
+    fun sendVideoFreezeRequest() {
+        sendFn?.invoke(JSONObject().apply { put("type", "pli") }.toString())
+        Log.i(TAG, "Video freeze detected — sent DataChannel PLI")
+    }
+
     private fun median(values: List<Long>): Long {
         val sorted = values.sorted()
         val mid = sorted.size / 2

@@ -84,6 +84,24 @@ static uint16_t  g_cam_width  = 0;
 static uint16_t  g_cam_height = 0;
 static size_t    g_cap_buf_len = 0;  // width * height * 3/2 (YUV420 / O_UYY_E_VYY)
 
+// Current H.264 bitrate (bps) — updated by camera_init and camera_set_bitrate.
+// Read by webrtc_streamer ABR from peer_loop task (core 0); written by camera_task
+// (core 1) only during init/reconfigure. volatile suffices: atomic 32-bit RMW.
+static volatile uint32_t g_cur_bitrate = 0;
+
+// Sensor + ISP handles — promoted to globals so _camera_reconfigure() can
+// tear down and recreate the pipeline without rerunning sensor detection.
+static esp_cam_sensor_device_t *g_sensor   = NULL;
+static isp_proc_handle_t        g_isp_hdl  = NULL;
+static isp_awb_ctlr_t           g_awb_ctlr = NULL;
+static isp_ae_ctlr_t            g_ae_ctlr  = NULL;
+
+// Resolution switch: set by camera_set_resolution() (any task), consumed by
+// camera_task (core 1) after the current encode completes.
+static volatile bool     g_res_pending = false;
+static volatile uint16_t g_pending_w   = 0;
+static volatile uint16_t g_pending_h   = 0;
+
 // Set by camera_request_idr(); camera_task forces GOP=1 on next encode,
 // then restores GOP=g_enc_fps after the IDR is produced.
 static volatile bool          g_force_idr = false;
@@ -150,12 +168,49 @@ static IRAM_ATTR bool s_awb_stats_done(isp_awb_ctlr_t ctlr,
 }
 
 // ──────────────────────────────────────────────
+// Forward declaration — defined below camera_task
+// ──────────────────────────────────────────────
+static void _camera_reconfigure(uint16_t new_w, uint16_t new_h);
+
+// ──────────────────────────────────────────────
 // Camera + encode task  (pinned to core 1)
 // ──────────────────────────────────────────────
 
 void camera_request_idr(void)
 {
     g_force_idr = true;
+}
+
+// ── Bitrate control (ABR) ─────────────────────────────────────────────────────
+
+uint32_t camera_get_bitrate(void)
+{
+    return g_cur_bitrate;
+}
+
+void camera_set_bitrate(uint32_t bitrate_bps)
+{
+    if (!g_encoder || bitrate_bps == 0) return;
+    esp_h264_enc_param_hw_handle_t hw_ph = NULL;
+    if (esp_h264_enc_hw_get_param_hd(g_encoder, &hw_ph) != ESP_H264_ERR_OK) return;
+    if (esp_h264_enc_set_bitrate((esp_h264_enc_param_handle_t)hw_ph, bitrate_bps)
+            == ESP_H264_ERR_OK) {
+        g_cur_bitrate = bitrate_bps;
+        ESP_LOGI(TAG, "ABR: bitrate → %" PRIu32 " bps", bitrate_bps);
+    } else {
+        ESP_LOGW(TAG, "ABR: esp_h264_enc_set_bitrate failed");
+    }
+}
+
+// ── Resolution switch (async, applied in camera_task) ────────────────────────
+
+void camera_set_resolution(uint16_t w, uint16_t h)
+{
+    if (w == 0 || h == 0) return;
+    g_pending_w   = w;
+    g_pending_h   = h;
+    g_res_pending = true;
+    ESP_LOGI(TAG, "Resolution switch requested: %ux%u (pending)", w, h);
 }
 
 // Helper: get the encoder param handle (used to change GOP).
@@ -258,6 +313,13 @@ static void camera_task(void *arg)
                 g_frame_cb(out_frame.raw_data.buffer, (size_t)out_frame.length,
                            capture_ts, encode_ms);
             }
+
+            // Resolution switch: applied after frame delivery so the callback
+            // always gets a complete frame before the pipeline restarts.
+            if (g_res_pending) {
+                g_res_pending = false;
+                _camera_reconfigure(g_pending_w, g_pending_h);
+            }
         } else if (ret != ESP_H264_ERR_OK) {
             ESP_LOGW(TAG, "H.264 enc_process error: %d", (int)ret);
         } else {
@@ -269,6 +331,269 @@ static void camera_task(void *arg)
             }
         }
     }
+}
+
+// ──────────────────────────────────────────────
+// _camera_reconfigure — tear down ISP+encoder, re-init with new resolution
+// Runs on camera_task (core 1). g_sensor must be valid.
+// ──────────────────────────────────────────────
+
+static void _camera_reconfigure(uint16_t new_w, uint16_t new_h)
+{
+    ESP_LOGI(TAG, "_camera_reconfigure: %ux%u → %ux%u",
+             g_cam_width, g_cam_height, new_w, new_h);
+
+    // ── 1. Close H.264 encoder ──
+    if (g_encoder) {
+        esp_h264_enc_close(g_encoder);
+        esp_h264_enc_del(g_encoder);
+        g_encoder = NULL;
+    }
+    heap_caps_free(g_h264_raw);
+    g_h264_raw = NULL;
+    g_h264_buf = NULL;
+
+    // ── 2. Tear down ISP controllers (AWB/AE/sharpen/color/gamma) ──
+    if (g_awb_ctlr) {
+        esp_isp_awb_controller_stop_continuous_statistics(g_awb_ctlr);
+        esp_isp_awb_controller_disable(g_awb_ctlr);
+        esp_isp_del_awb_controller(g_awb_ctlr);
+        g_awb_ctlr = NULL;
+    }
+    if (g_ae_ctlr) {
+        esp_isp_ae_controller_stop_continuous_statistics(g_ae_ctlr);
+        esp_isp_ae_controller_disable(g_ae_ctlr);
+        esp_isp_del_ae_controller(g_ae_ctlr);
+        g_ae_ctlr = NULL;
+    }
+
+    // ── 3. Disable + delete ISP ──
+    if (g_isp_hdl) {
+        esp_isp_sharpen_disable(g_isp_hdl);
+        esp_isp_color_disable(g_isp_hdl);
+        esp_isp_gamma_disable(g_isp_hdl);
+        esp_isp_disable(g_isp_hdl);
+        esp_isp_del_processor(g_isp_hdl);
+        g_isp_hdl = NULL;
+    }
+
+    // ── 4. Stop + disable + delete CSI ──
+    if (g_cam_hdl) {
+        esp_cam_ctlr_stop(g_cam_hdl);
+        esp_cam_ctlr_disable(g_cam_hdl);
+        esp_cam_ctlr_del(g_cam_hdl);
+        g_cam_hdl = NULL;
+    }
+
+    // ── 5. Free old capture buffers ──
+    for (int i = 0; i < NUM_CAP_BUFS; i++) {
+        heap_caps_free(g_cap_raw[i]);
+        g_cap_raw[i] = NULL;
+        g_cap_buf[i] = NULL;
+    }
+
+    // ── 6. Find sensor format for new resolution ──
+    if (!g_sensor) {
+        ESP_LOGE(TAG, "_camera_reconfigure: g_sensor is NULL — cannot reconfigure");
+        return;
+    }
+    esp_cam_sensor_format_array_t fmt_arr = {0};
+    esp_cam_sensor_query_format(g_sensor, &fmt_arr);
+
+    const esp_cam_sensor_format_t *selected = NULL;
+    int best_score = -1;
+    for (int i = 0; i < (int)fmt_arr.count; i++) {
+        const esp_cam_sensor_format_t *f = &fmt_arr.format_array[i];
+        if (f->width < f->height) continue;
+        // Exact match preferred; fall back to score-based selection
+        int score = 0;
+        if (f->width == new_w && f->height == new_h) score += 1000;
+        if (f->format != ESP_CAM_SENSOR_PIXFORMAT_RAW10) score += 100;
+        if (f->width <= 800 && f->height <= 640)  score += 50;
+        else if (f->width <= 800)                  score += 30;
+        else if (f->width <= 1280)                 score += 10;
+        if (f->fps <= 30) score += 5;
+        if (score > best_score) { best_score = score; selected = f; }
+    }
+    if (!selected && fmt_arr.count > 0) selected = &fmt_arr.format_array[0];
+    if (!selected) {
+        ESP_LOGE(TAG, "_camera_reconfigure: no sensor format found");
+        return;
+    }
+    ESP_LOGI(TAG, "Reconfigure: using format %s (%ux%u @ %u fps)",
+             selected->name, selected->width, selected->height, selected->fps);
+
+    // ── 7. Set new sensor format + update global dims ──
+    if (esp_cam_sensor_set_format(g_sensor, selected) != ESP_OK) {
+        ESP_LOGE(TAG, "_camera_reconfigure: sensor set_format failed");
+        return;
+    }
+    g_cam_width   = selected->width;
+    g_cam_height  = selected->height;
+    g_cap_buf_len = (size_t)g_cam_width * g_cam_height * 3 / 2;
+
+    cam_ctlr_color_t csi_input_color;
+    isp_color_t      isp_input_color;
+    if (selected->format == ESP_CAM_SENSOR_PIXFORMAT_RAW10) {
+        csi_input_color = CAM_CTLR_COLOR_RAW10;
+        isp_input_color = ISP_COLOR_RAW10;
+    } else {
+        csi_input_color = CAM_CTLR_COLOR_RAW8;
+        isp_input_color = ISP_COLOR_RAW8;
+    }
+    uint32_t mipi_mbps  = selected->mipi_info.mipi_clk / 1000000UL;
+    int      mipi_lanes = (int)selected->mipi_info.lane_num;
+
+    // ── 8. Allocate new capture buffers ──
+    g_dma_next = 0;
+    for (int i = 0; i < NUM_CAP_BUFS; i++) {
+        g_cap_raw[i] = heap_caps_malloc(g_cap_buf_len + 63,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_cap_raw[i]) {
+            ESP_LOGE(TAG, "_camera_reconfigure: cap_buf[%d] alloc failed", i);
+            return;
+        }
+        g_cap_buf[i] = (uint8_t *)(((uintptr_t)g_cap_raw[i] + 63) & ~(uintptr_t)63);
+    }
+
+    // ── 9. Recreate CSI ──
+    esp_cam_ctlr_csi_config_t csi_cfg = {
+        .ctlr_id               = 0,
+        .h_res                 = g_cam_width,
+        .v_res                 = g_cam_height,
+        .data_lane_num         = mipi_lanes,
+        .lane_bit_rate_mbps    = mipi_mbps,
+        .input_data_color_type = csi_input_color,
+        .output_data_color_type= CAM_CTLR_COLOR_YUV420,
+        .queue_items           = 1,
+        .byte_swap_en          = false,
+        .bk_buffer_dis         = true,
+    };
+    if (esp_cam_new_csi_ctlr(&csi_cfg, &g_cam_hdl) != ESP_OK) {
+        ESP_LOGE(TAG, "_camera_reconfigure: CSI create failed"); return;
+    }
+    esp_cam_ctlr_evt_cbs_t cbs = {
+        .on_get_new_trans  = s_cam_get_new_trans,
+        .on_trans_finished = s_cam_trans_finished,
+    };
+    if (esp_cam_ctlr_register_event_callbacks(g_cam_hdl, &cbs, NULL) != ESP_OK) {
+        ESP_LOGE(TAG, "_camera_reconfigure: CSI callback register failed"); return;
+    }
+    if (esp_cam_ctlr_enable(g_cam_hdl) != ESP_OK) {
+        ESP_LOGE(TAG, "_camera_reconfigure: CSI enable failed"); return;
+    }
+
+    // ── 10. Recreate ISP ──
+    esp_isp_processor_cfg_t isp_cfg = {
+        .clk_hz                 = 80 * 1000 * 1000,
+        .input_data_source      = ISP_INPUT_DATA_SOURCE_CSI,
+        .input_data_color_type  = isp_input_color,
+        .output_data_color_type = ISP_COLOR_YUV420,
+        .has_line_start_packet  = selected->mipi_info.line_sync_en,
+        .has_line_end_packet    = false,
+        .h_res                  = g_cam_width,
+        .v_res                  = g_cam_height,
+    };
+    g_isp_hdl = NULL;
+    if (esp_isp_new_processor(&isp_cfg, &g_isp_hdl) != ESP_OK) {
+        ESP_LOGE(TAG, "_camera_reconfigure: ISP create failed"); return;
+    }
+    esp_isp_enable(g_isp_hdl);
+
+    // ── 11. Recreate ISP modules ──
+    esp_isp_awb_config_t awb_cfg = {
+        .sample_point = ISP_AWB_SAMPLE_POINT_AFTER_CCM,
+        .window = {
+            .top_left  = { .x = g_cam_width / 5,     .y = g_cam_height / 5 },
+            .btm_right = { .x = g_cam_width * 4 / 5, .y = g_cam_height * 4 / 5 },
+        },
+        .white_patch = {
+            .luminance        = { .min = 0, .max = 220 * 3 },
+            .red_green_ratio  = { .min = 0.0f, .max = 3.999f },
+            .blue_green_ratio = { .min = 0.0f, .max = 3.999f },
+        },
+    };
+    g_awb_ctlr = NULL;
+    if (esp_isp_new_awb_controller(g_isp_hdl, &awb_cfg, &g_awb_ctlr) == ESP_OK) {
+        esp_isp_awb_cbs_t awb_cbs = { .on_statistics_done = s_awb_stats_done };
+        esp_isp_awb_register_event_callbacks(g_awb_ctlr, &awb_cbs, NULL);
+        esp_isp_awb_controller_enable(g_awb_ctlr);
+        esp_isp_awb_controller_start_continuous_statistics(g_awb_ctlr);
+    }
+    esp_isp_ae_config_t ae_cfg = { .sample_point = ISP_AE_SAMPLE_POINT_AFTER_DEMOSAIC };
+    g_ae_ctlr = NULL;
+    if (esp_isp_new_ae_controller(g_isp_hdl, &ae_cfg, &g_ae_ctlr) == ESP_OK) {
+        esp_isp_ae_controller_enable(g_ae_ctlr);
+        esp_isp_ae_controller_start_continuous_statistics(g_ae_ctlr);
+    }
+    esp_isp_sharpen_config_t sharpen_cfg = {
+        .h_freq_coeff = { .val = (2 << ISP_SHARPEN_H_FREQ_COEF_DEC_BITS) },
+        .m_freq_coeff = { .val = (1 << ISP_SHARPEN_M_FREQ_COEF_DEC_BITS) | (1 << (ISP_SHARPEN_M_FREQ_COEF_DEC_BITS - 1)) },
+        .h_thresh = 30, .l_thresh = 5,
+        .padding_mode = ISP_SHARPEN_EDGE_PADDING_MODE_SRND_DATA,
+        .sharpen_template = { {1,2,1}, {2,4,2}, {1,2,1} },
+    };
+    if (esp_isp_sharpen_configure(g_isp_hdl, &sharpen_cfg) == ESP_OK)
+        esp_isp_sharpen_enable(g_isp_hdl);
+    esp_isp_color_config_t color_cfg = {
+        .color_contrast   = { .val = (1 << 7) | 64 },
+        .color_saturation = { .val = (1 << 7) | 127 },
+        .color_hue        = 0,
+        .color_brightness = -15,
+    };
+    if (esp_isp_color_configure(g_isp_hdl, &color_cfg) == ESP_OK)
+        esp_isp_color_enable(g_isp_hdl);
+    isp_gamma_curve_points_t gamma_pts = { .pt = {
+        { .x= 16,.y= 28},{ .x= 32,.y= 48},{ .x= 48,.y= 64},{ .x= 64,.y= 79},
+        { .x= 80,.y= 93},{ .x= 96,.y=107},{ .x=112,.y=119},{ .x=128,.y=132},
+        { .x=144,.y=144},{ .x=160,.y=156},{ .x=176,.y=168},{ .x=192,.y=180},
+        { .x=208,.y=192},{ .x=224,.y=204},{ .x=240,.y=216},{ .x=255,.y=255},
+    }};
+    esp_isp_gamma_configure(g_isp_hdl, COLOR_COMPONENT_R, &gamma_pts);
+    esp_isp_gamma_configure(g_isp_hdl, COLOR_COMPONENT_G, &gamma_pts);
+    esp_isp_gamma_configure(g_isp_hdl, COLOR_COMPONENT_B, &gamma_pts);
+    esp_isp_gamma_enable(g_isp_hdl);
+
+    // ── 12. Start CSI + stream-on sensor ──
+    if (esp_cam_ctlr_start(g_cam_hdl) != ESP_OK) {
+        ESP_LOGE(TAG, "_camera_reconfigure: CSI start failed"); return;
+    }
+    int stream_on = 1;
+    if (esp_cam_sensor_ioctl(g_sensor, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_on) != ESP_OK) {
+        ESP_LOGE(TAG, "_camera_reconfigure: sensor stream-on failed");
+    }
+
+    // ── 13. Allocate H.264 output buffer ──
+    g_h264_raw = heap_caps_malloc(g_cap_buf_len + 63, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g_h264_raw) {
+        ESP_LOGE(TAG, "_camera_reconfigure: H264 buf alloc failed"); return;
+    }
+    g_h264_buf = (uint8_t *)(((uintptr_t)g_h264_raw + 63) & ~(uintptr_t)63);
+
+    // ── 14. Recreate H.264 encoder with new resolution ──
+    uint8_t enc_fps    = g_enc_fps;
+    uint32_t pixels    = (uint32_t)g_cam_width * g_cam_height;
+    uint32_t bitrate   = (uint32_t)(4000000ULL * pixels / (1280 * 720));
+    if (bitrate < 1500000) bitrate = 1500000;
+    if (bitrate > 8000000) bitrate = 8000000;
+    esp_h264_enc_cfg_hw_t enc_cfg = {
+        .pic_type = ESP_H264_RAW_FMT_O_UYY_E_VYY,
+        .gop      = ENC_GOP,
+        .fps      = enc_fps,
+        .res      = { .width = g_cam_width, .height = g_cam_height },
+        .rc       = { .bitrate = bitrate, .qp_min = 20, .qp_max = 38 },
+    };
+    g_encoder = NULL;
+    if (esp_h264_enc_hw_new(&enc_cfg, &g_encoder) != ESP_H264_ERR_OK ||
+        esp_h264_enc_open(g_encoder) != ESP_H264_ERR_OK) {
+        ESP_LOGE(TAG, "_camera_reconfigure: H264 encoder init failed");
+        g_encoder = NULL;
+        return;
+    }
+    g_cur_bitrate = bitrate;
+
+    ESP_LOGI(TAG, "Resolution reconfigured: %ux%u @ fps=%u bitrate=%" PRIu32,
+             g_cam_width, g_cam_height, enc_fps, bitrate);
 }
 
 // ──────────────────────────────────────────────
@@ -321,7 +646,7 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
         .pwdn_pin    = -1,
         .xclk_pin    = -1,
     };
-    esp_cam_sensor_device_t *sensor = NULL;
+    g_sensor = NULL;
 
     for (esp_cam_sensor_detect_fn_t *p = &__esp_cam_sensor_detect_fn_array_start;
          p < &__esp_cam_sensor_detect_fn_array_end; ++p) {
@@ -334,14 +659,14 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
             continue;
         }
         sensor_cfg.sensor_port = p->port;
-        sensor = (*(p->detect))(&sensor_cfg);
-        if (sensor) {
+        g_sensor = (*(p->detect))(&sensor_cfg);
+        if (g_sensor) {
             ESP_LOGI(TAG, "Camera sensor detected");
             break;
         }
         esp_sccb_del_i2c_io(sensor_cfg.sccb_handle);
     }
-    if (!sensor) {
+    if (!g_sensor) {
         ESP_LOGE(TAG, "No camera sensor detected on I2C bus (SDA=%d SCL=%d)",
                  CAM_SCCB_SDA_IO, CAM_SCCB_SCL_IO);
         return ESP_ERR_NOT_FOUND;
@@ -359,7 +684,7 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
     // RAW10 1280×960@45fps is avoided: encode ~98ms vs ring cycle 132ms leaves
     // only 34ms margin; IDR frames overshoot → DMA buffer race → noise.
     esp_cam_sensor_format_array_t fmt_arr = {0};
-    esp_cam_sensor_query_format(sensor, &fmt_arr);
+    esp_cam_sensor_query_format(g_sensor, &fmt_arr);
 
     const esp_cam_sensor_format_t *selected = NULL;
     int  best_score = -1;
@@ -427,7 +752,7 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
     int      mipi_lanes = (int)selected->mipi_info.lane_num;
     ESP_LOGI(TAG, "MIPI: %d lanes @ %"PRIu32" Mbps", mipi_lanes, mipi_mbps);
 
-    ESP_RETURN_ON_ERROR(esp_cam_sensor_set_format(sensor, selected),
+    ESP_RETURN_ON_ERROR(esp_cam_sensor_set_format(g_sensor, selected),
                         TAG, "Sensor set_format failed");
 
     // NOTE: sensor stream-on is deferred to step 10, AFTER CSI+ISP are ready.
@@ -485,7 +810,7 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
                         TAG, "CSI enable failed");
 
     // ISP: RAW→YUV420 (O_UYY_E_VYY), resolution from sensor format
-    isp_proc_handle_t isp_hdl = NULL;
+    g_isp_hdl = NULL;
     esp_isp_processor_cfg_t isp_cfg = {
         .clk_hz                 = 80 * 1000 * 1000,
         .input_data_source      = ISP_INPUT_DATA_SOURCE_CSI,
@@ -496,9 +821,9 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
         .h_res                  = g_cam_width,
         .v_res                  = g_cam_height,
     };
-    ESP_RETURN_ON_ERROR(esp_isp_new_processor(&isp_cfg, &isp_hdl),
+    ESP_RETURN_ON_ERROR(esp_isp_new_processor(&isp_cfg, &g_isp_hdl),
                         TAG, "ISP init failed");
-    ESP_RETURN_ON_ERROR(esp_isp_enable(isp_hdl),
+    ESP_RETURN_ON_ERROR(esp_isp_enable(g_isp_hdl),
                         TAG, "ISP enable failed");
 
     // ── AWB: auto white balance ──
@@ -514,14 +839,14 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
             .blue_green_ratio = { .min = 0.0f, .max = 3.999f },
         },
     };
-    isp_awb_ctlr_t awb_ctlr = NULL;
-    esp_err_t awb_ret = esp_isp_new_awb_controller(isp_hdl, &awb_cfg, &awb_ctlr);
+    g_awb_ctlr = NULL;
+    esp_err_t awb_ret = esp_isp_new_awb_controller(g_isp_hdl, &awb_cfg, &g_awb_ctlr);
     if (awb_ret == ESP_OK) {
         // Register callback — required by start_continuous_statistics
         esp_isp_awb_cbs_t awb_cbs = { .on_statistics_done = s_awb_stats_done };
-        esp_isp_awb_register_event_callbacks(awb_ctlr, &awb_cbs, NULL);
-        esp_isp_awb_controller_enable(awb_ctlr);
-        esp_isp_awb_controller_start_continuous_statistics(awb_ctlr);
+        esp_isp_awb_register_event_callbacks(g_awb_ctlr, &awb_cbs, NULL);
+        esp_isp_awb_controller_enable(g_awb_ctlr);
+        esp_isp_awb_controller_start_continuous_statistics(g_awb_ctlr);
         ESP_LOGI(TAG, "ISP AWB controller started");
     } else {
         ESP_LOGW(TAG, "ISP AWB init failed (%s)", esp_err_to_name(awb_ret));
@@ -531,11 +856,11 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
     esp_isp_ae_config_t ae_cfg = {
         .sample_point = ISP_AE_SAMPLE_POINT_AFTER_DEMOSAIC,
     };
-    isp_ae_ctlr_t ae_ctlr = NULL;
-    esp_err_t ae_ret = esp_isp_new_ae_controller(isp_hdl, &ae_cfg, &ae_ctlr);
+    g_ae_ctlr = NULL;
+    esp_err_t ae_ret = esp_isp_new_ae_controller(g_isp_hdl, &ae_cfg, &g_ae_ctlr);
     if (ae_ret == ESP_OK) {
-        esp_isp_ae_controller_enable(ae_ctlr);
-        esp_isp_ae_controller_start_continuous_statistics(ae_ctlr);
+        esp_isp_ae_controller_enable(g_ae_ctlr);
+        esp_isp_ae_controller_start_continuous_statistics(g_ae_ctlr);
         ESP_LOGI(TAG, "ISP AE controller started");
     } else {
         ESP_LOGW(TAG, "ISP AE init failed (%s)", esp_err_to_name(ae_ret));
@@ -556,9 +881,9 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
             {1, 2, 1},
         },
     };
-    esp_err_t shp_ret = esp_isp_sharpen_configure(isp_hdl, &sharpen_cfg);
+    esp_err_t shp_ret = esp_isp_sharpen_configure(g_isp_hdl, &sharpen_cfg);
     if (shp_ret == ESP_OK) {
-        esp_isp_sharpen_enable(isp_hdl);
+        esp_isp_sharpen_enable(g_isp_hdl);
         ESP_LOGI(TAG, "ISP Sharpen enabled (h_coeff=2.0, m_coeff=1.5)");
     } else {
         ESP_LOGW(TAG, "ISP Sharpen configure failed (%s)", esp_err_to_name(shp_ret));
@@ -573,9 +898,9 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
         .color_hue        = 0,
         .color_brightness = -15,                        // compensate gamma lift
     };
-    esp_err_t clr_ret = esp_isp_color_configure(isp_hdl, &color_cfg);
+    esp_err_t clr_ret = esp_isp_color_configure(g_isp_hdl, &color_cfg);
     if (clr_ret == ESP_OK) {
-        esp_isp_color_enable(isp_hdl);
+        esp_isp_color_enable(g_isp_hdl);
         ESP_LOGI(TAG, "ISP Color enabled (contrast=1.5, saturation=2.0, brightness=-15)");
     } else {
         ESP_LOGW(TAG, "ISP Color configure failed (%s)", esp_err_to_name(clr_ret));
@@ -602,10 +927,10 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
         { .x = 240, .y = 216 },
         { .x = 255, .y = 255 },
     }};
-    esp_isp_gamma_configure(isp_hdl, COLOR_COMPONENT_R, &gamma_pts);
-    esp_isp_gamma_configure(isp_hdl, COLOR_COMPONENT_G, &gamma_pts);
-    esp_isp_gamma_configure(isp_hdl, COLOR_COMPONENT_B, &gamma_pts);
-    esp_isp_gamma_enable(isp_hdl);
+    esp_isp_gamma_configure(g_isp_hdl, COLOR_COMPONENT_R, &gamma_pts);
+    esp_isp_gamma_configure(g_isp_hdl, COLOR_COMPONENT_G, &gamma_pts);
+    esp_isp_gamma_configure(g_isp_hdl, COLOR_COMPONENT_B, &gamma_pts);
+    esp_isp_gamma_enable(g_isp_hdl);
     ESP_LOGI(TAG, "ISP Gamma enabled (gamma=1.3 correction)");
 
     // ── 9. Start CSI (calls on_get_new_trans to obtain the first buffer) ──
@@ -614,7 +939,7 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
 
     // ── 10. NOW start the sensor — MIPI receiver (CSI) and ISP are both ready ──
     int stream_on = 1;
-    ESP_RETURN_ON_ERROR(esp_cam_sensor_ioctl(sensor, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_on),
+    ESP_RETURN_ON_ERROR(esp_cam_sensor_ioctl(g_sensor, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_on),
                         TAG, "Sensor stream enable failed");
 
     // ── 11. Allocate H.264 output buffer (PSRAM, manually 64-byte aligned) ──
@@ -660,6 +985,7 @@ esp_err_t camera_init(camera_frame_cb_t frame_cb)
         ESP_LOGE(TAG, "esp_h264_enc_open failed: %d", (int)h264_ret);
         return ESP_FAIL;
     }
+    g_cur_bitrate = bitrate;    // track for ABR (camera_get_bitrate)
 
     // ── 13. Start camera processing task (core 1, stack 8 kB, prio 5) ──
     BaseType_t r = xTaskCreatePinnedToCore(camera_task, "cam_task",

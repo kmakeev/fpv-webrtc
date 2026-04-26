@@ -19,3 +19,14 @@ void      camera_deinit(void);
 // Request that the next encoded frame be an IDR (keyframe).
 // Thread-safe; may be called from any task (e.g. on WebRTC connect or PLI).
 void      camera_request_idr(void);
+
+// Dynamic bitrate control — used by ABR in webrtc_streamer.c.
+// camera_set_bitrate(): updates H.264 rate-control without encoder restart.
+// camera_get_bitrate(): returns current bitrate (bps); 0 if encoder not ready.
+void      camera_set_bitrate(uint32_t bitrate_bps);
+uint32_t  camera_get_bitrate(void);
+
+// Request a resolution switch via DataChannel {type:'resolution', w, h}.
+// Non-blocking: stores pending resolution; camera_task (core 1) applies it
+// after the current encode completes, then fully restarts ISP + encoder.
+void      camera_set_resolution(uint16_t w, uint16_t h);
